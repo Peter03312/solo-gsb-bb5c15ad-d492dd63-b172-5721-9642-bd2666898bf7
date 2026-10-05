@@ -13,6 +13,7 @@ const state = {
   deputies: null,
   skipPreview: null,
   whatifInputs: new Map(),
+  reviewEnv: null,
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -471,6 +472,31 @@ async function loadLive() {
     catch { state.deputies = null; }
   }
   renderLive();
+  if (state.me.role === 'sm' && state.live) {
+    loadReviewLive().catch(() => { state.reviewEnv = null; renderReviewPanel(); });
+  }
+}
+
+// ---------- 舞监：执行版复盘（实时预览 + 封存） ----------
+
+async function loadReviewLive() {
+  state.reviewEnv = await api('GET', '/api/live');
+  renderReviewPanel();
+}
+
+function renderReviewPanel() {
+  const panel = $('#review-panel');
+  if (!panel) return;
+  const show = state.me?.role === 'sm' && state.live && state.live.isLatest;
+  panel.hidden = !show;
+  if (!show) return;
+  const tag = $('#review-sealed-tag');
+  const env = state.reviewEnv;
+  if (env?.sealed) {
+    tag.innerHTML = `<span class="review-sealed-tag">🔒 本版复盘已于 ${esc(env.sealed.sealedAt)} 由 ${esc(env.sealed.sealedBy)} 封存（快照不可改写，可回看）</span>`;
+  } else {
+    tag.innerHTML = '<span class="muted">本版尚未封存复盘。</span>';
+  }
 }
 
 function statusBadge(s) {
@@ -646,6 +672,7 @@ function renderLive() {
     $('#deputy-panel').hidden = true;
     $('#interruption-panel').hidden = true;
     $('#whatif-panel').hidden = true;
+    $('#review-panel').hidden = true;
     $('#live-tbody').innerHTML = '';
     return;
   }
@@ -1554,6 +1581,205 @@ $('#modal-overlay').addEventListener('submit', async (ev) => {
   }
 });
 
+// ---------- 舞监：执行版复盘（预览 / 封存 / 快照回看） ----------
+
+function signedMin(n) {
+  if (n === null || n === undefined) return '—';
+  if (n > 0) return `+${n}`;
+  return String(n);
+}
+
+function reviewStatusBadge(status) {
+  if (status === 'DONE') return '<span class="badge done">本版完成</span>';
+  if (status === 'DONE_HANDOVER') return '<span class="badge handover">↩ 交接完成</span>';
+  if (status === 'RUNNING') return '<span class="badge running">进行中</span>';
+  if (status === 'SKIPPED') return '<span class="badge skipped">已跳过</span>';
+  return '<span class="badge pending">未开始</span>';
+}
+
+// 复盘明细表（实时预览与封存快照共用）
+function reviewCuesHtml(cues) {
+  return `<div class="table-wrap review-table-wrap"><table>
+    <thead><tr>
+      <th>编号</th><th>说明</th><th>岗位</th><th>计划时段</th>
+      <th>状态</th><th>实际开始</th><th>实际完成</th>
+      <th>开始偏差(分)</th><th>实际持续(分)</th><th>停排扣除(分)</th><th>净执行(分)</th><th>行版本</th>
+    </tr></thead>
+    <tbody>${cues.map((c) => {
+      const done = c.status === 'DONE' || c.status === 'DONE_HANDOVER';
+      const rowCls = c.status === 'DONE' ? 'review-done-row'
+        : c.status === 'DONE_HANDOVER' ? 'review-handover-row'
+        : c.status === 'SKIPPED' ? 'skipped-row' : '';
+      const handover = c.handover
+        ? `<div class="handover-tag">↩ 交接自第 ${esc(c.handover.sourceVersionNo ?? '?')} 版·${esc(c.handover.sourceCode || c.code)}</div>` : '';
+      return `<tr class="${rowCls}">
+        <td><strong>${esc(c.code)}</strong>${handover}</td>
+        <td>${esc(c.title || '')}</td>
+        <td>${esc(c.position)}</td>
+        <td class="mono">${esc(c.plannedStartText)} - ${esc(c.plannedEndText)}</td>
+        <td>${reviewStatusBadge(c.status)}${c.status === 'DONE_HANDOVER' ? '<div class="muted">不计入本版汇总</div>' : ''}</td>
+        <td class="mono">${esc(c.actualStartText ?? '—')}</td>
+        <td class="mono">${esc(c.actualEndText ?? '—')}</td>
+        <td class="mono review-delta">${done ? esc(signedMin(c.startDeltaMinutes)) : '—'}</td>
+        <td class="mono">${done ? c.actualDurationMinutes : '—'}</td>
+        <td class="mono">${done && c.status === 'DONE' ? c.deductedPauseMinutes : '—'}</td>
+        <td class="mono"><strong>${done && c.status === 'DONE' ? c.netDurationMinutes : '—'}</strong></td>
+        <td class="mono muted">v${c.rowVer}</td>
+      </tr>`;
+    }).join('')}</tbody>
+  </table></div>
+  <div class="muted">开始偏差＝实际开始 − 计划开始（正为晚开始、负为提前）；净执行＝实际持续 − 实际起止区间与已结束停排段的交集分钟（半开区间，重叠分钟只扣一次）；进行中的停排不扣。</div>`;
+}
+
+// 岗位汇总 + 本版合计
+function reviewSummaryHtml(live) {
+  const posRows = live.positions.length
+    ? live.positions.map((p) => `<tr>
+        <td>${esc(p.position)}</td>
+        <td class="mono">${p.doneCount}</td>
+        <td class="mono">${p.netDurationMinutes}</td>
+        <td class="mono review-delta">${esc(signedMin(p.startDeltaSum))}</td>
+      </tr>`).join('')
+    : '<tr><td colspan="4" class="muted">本版暂无完成项。</td></tr>';
+  return `<div class="review-positions">
+    <table>
+      <thead><tr><th>岗位</th><th>本版完成数</th><th>净执行分钟</th><th>开始偏差之和(分)</th></tr></thead>
+      <tbody>${posRows}</tbody>
+      <tfoot><tr>
+        <th>本版合计</th>
+        <th class="mono">${live.totals.doneCount}</th>
+        <th class="mono">${live.totals.netDurationMinutes}</th>
+        <th class="mono review-delta">${esc(signedMin(live.totals.startDeltaSum))}</th>
+      </tr></tfoot>
+    </table>
+    <div class="muted">
+      全部 ${live.counts.total} 项：本版完成 ${live.counts.done}、
+      交接自旧版完成 ${live.counts.doneHandover}、进行中 ${live.counts.running}、
+      未开始 ${live.counts.pending}、已跳过 ${live.counts.skipped}；
+      交接完成 / 进行中 / 未开始 / 已跳过均不计入本版完成汇总。
+    </div>
+  </div>`;
+}
+
+function reviewBasisHtml(env) {
+  const pauses = env.basis?.closedInterruptions || [];
+  const active = env.basis?.activePause;
+  return `<div class="review-basis muted">
+    封存依据：执行版第 ${env.versionNo} 版；全部登记行版本 ${env.basis?.rows.length ?? 0} 条；
+    已结束停排 ${pauses.length} 段${pauses.length ? '（' + pauses.map((p) => esc(p.pauseText) + '–' + esc(p.resumeText)).join('、') + '）' : ''}；
+    ${active ? `当前<strong>停排中</strong>（${esc(active.pauseText)} 起，进行中的停排不扣净执行）` : '当前无进行中停排'}。
+    封存时将在同一事务内复核，任一依据变化整体拒绝。
+  </div>`;
+}
+
+// 打开当前执行版复盘预览弹窗
+async function openReviewLive() {
+  try {
+    const env = await api('GET', '/api/live/review');
+    state.reviewEnv = env;
+    renderReviewPanel();
+    showReviewModal(env, false);
+  } catch (e) { alertBar('error', errorToHtml(e)); }
+}
+
+function showReviewModal(env, isHistory) {
+  const sealed = env.sealed;
+  const title = isHistory
+    ? `第 ${env.versionNo} 版复盘回看${env.isLatest ? '（当前执行版）' : '（历史版 · 只读）'}`
+    : `第 ${env.versionNo} 版复盘预览（当前执行版）`;
+  const sealBox = (!isHistory && !sealed) ? `
+    <div class="review-seal-box">
+      <label>复盘备注（可选，≤200 字）<input id="review-note" maxlength="200" placeholder="如：首场联排复盘" /></label>
+      <div class="form-actions">
+        <button type="button" class="danger" id="review-seal-btn">封存复盘（每版仅一次，封存后不可改写）</button>
+      </div>
+    </div>` : '';
+  const sealedBox = sealed ? `
+    <div class="review-sealed-banner">🔒 本版复盘已于 <strong>${esc(sealed.sealedAt)}</strong> 由 ${esc(sealed.sealedBy)} 封存${sealed.note ? '；备注：' + esc(sealed.note) : ''}。以下封存快照为当时明细与汇总，此后登记更正、交接或发布新版均不改写。</div>` : '';
+  openModal(title, `
+    ${sealedBox}
+    <h4>实时明细（${isHistory ? '随该版当前登记变化' : '更正 / 停排恢复后重开即更新'}）</h4>
+    ${reviewCuesHtml(env.live.cues)}
+    <h4>按岗位汇总</h4>
+    ${reviewSummaryHtml(env.live)}
+    ${reviewBasisHtml(env)}
+    ${sealBox}
+  `);
+  const btn = $('#review-seal-btn');
+  if (btn) btn.addEventListener('click', () => sealReview(env));
+}
+
+// 历史版本复盘回看：实时明细 + 已封存快照
+async function openReviewHistory(versionId) {
+  try {
+    const env = await api('GET', `/api/versions/${versionId}/review`);
+    openModal(`第 ${env.versionNo} 版复盘回看${env.isLatest ? '（当前执行版）' : '（历史版）'}`, '<span class="muted">加载中…</span>');
+    const body = $('#modal-body');
+    const sealedBanner = env.snapshot
+      ? `<div class="review-sealed-banner">🔒 已封存快照：<strong>${esc(env.snapshot.sealedAt)}</strong> 由 ${esc(env.snapshot.sealedBy)} 封存${env.snapshot.note ? '；备注：' + esc(env.snapshot.note) : ''}（不可改写）</div>`
+      : '<div class="muted">该版尚未封存复盘，仅可查看实时明细。</div>';
+    body.innerHTML = `
+      <div class="review-snapshot-toggle">
+        <button type="button" class="ghost tiny" id="review-tab-live">实时明细</button>
+        <button type="button" class="ghost tiny" id="review-tab-snap" ${env.snapshot ? '' : 'disabled'}>已封存快照</button>
+      </div>
+      <div id="review-pane-live">
+        ${sealedBanner}
+        <h4>实时明细</h4>
+        ${reviewCuesHtml(env.live.cues)}
+        <h4>按岗位汇总</h4>
+        ${reviewSummaryHtml(env.live)}
+      </div>
+      <div id="review-pane-snap" hidden>
+        ${env.snapshot ? `
+          ${sealedBanner}
+          <h4>封存时明细快照</h4>
+          ${reviewCuesHtml(env.snapshot.detail)}
+          <h4>封存时岗位汇总快照</h4>
+          ${reviewSummaryHtml({ positions: env.snapshot.summary.positions, totals: env.snapshot.summary.totals, counts: env.snapshot.summary.counts })}
+        ` : '<div class="muted">该版尚未封存复盘。</div>'}
+      </div>`;
+    $('#review-tab-live').addEventListener('click', () => {
+      $('#review-pane-live').hidden = false; $('#review-pane-snap').hidden = true;
+    });
+    $('#review-tab-snap').addEventListener('click', () => {
+      $('#review-pane-live').hidden = true; $('#review-pane-snap').hidden = false;
+    });
+  } catch (e) { alertBar('error', errorToHtml(e)); }
+}
+
+// 封存：携预览所见执行版、全部登记行版本与停排状态提交；任一依据变化整体拒绝
+async function sealReview(env) {
+  const note = $('#review-note')?.value.trim() || '';
+  if (!confirm('确认封存本版复盘？\n封存将核对所见执行版、全部登记行版本与停排状态，任一依据变化会整体拒绝；每版仅能封存一次，封存后明细与汇总作为当时快照永久保存，此后更正、交接或发布新版均不得改写。')) return;
+  const btn = $('#review-seal-btn');
+  btn.disabled = true;
+  try {
+    const updated = await api('POST', '/api/live/review/seal', {
+      versionId: env.versionId,
+      note,
+      basis: env.basis,
+    });
+    state.reviewEnv = updated;
+    renderReviewPanel();
+    closeModal();
+    alertBar('ok', `🔒 第 ${env.versionNo} 版复盘已封存（${updated.sealed.sealedAt}），快照不可改写；可在「发布版本」页回看。`);
+    loadVersions().catch(() => {});
+  } catch (e) {
+    btn.disabled = false;
+    alertBar('error', errorToHtml(e), 10000);
+    // 依据变化：刷新预览数据，引导重开
+    if (e.status === 409) {
+      try {
+        state.reviewEnv = await api('GET', '/api/live/review');
+        renderReviewPanel();
+      } catch { /* ignore */ }
+    }
+  }
+}
+
+$('#review-open')?.addEventListener('click', openReviewLive);
+
 // ---------- 已发布版本回看 ----------
 
 async function loadVersions() {
@@ -1572,12 +1798,23 @@ function renderVersions() {
       <td>${v.regCount}</td>
       <td>${v.skipCount ? `<span class="skip-count">⛔ ${v.skipCount}</span>` : 0}</td>
       <td>${v.interruptionCount ? `<span class="pause-count ${v.interruptionActive ? 'pause-count-active' : ''}">⏸ ${v.interruptionCount}${v.interruptionActive ? '（进行中）' : ''}</span>` : 0}</td>
-      <td><button class="ghost tiny" data-act="view-version" data-id="${v.id}">回看</button></td>
+      <td>${v.reviewSealed
+        ? `<span class="review-sealed-tag" title="封存于 ${esc(v.reviewSealedAt || '')}">🔒 已封存</span>`
+        : '<span class="muted">未封存</span>'}</td>
+      <td>
+        <button class="ghost tiny" data-act="view-version" data-id="${v.id}">回看</button>
+        ${state.me?.role === 'sm' ? `<button class="ghost tiny" data-act="view-review" data-id="${v.id}">复盘</button>` : ''}
+      </td>
     </tr>`).join('')
-    || '<tr><td colspan="8" class="muted">暂无已发布版本。</td></tr>';
+    || '<tr><td colspan="9" class="muted">暂无已发布版本。</td></tr>';
 }
 
 $('#versions-tbody').addEventListener('click', async (ev) => {
+  const reviewBtn = ev.target.closest('button[data-act="view-review"]');
+  if (reviewBtn && state.me?.role === 'sm') {
+    await openReviewHistory(Number(reviewBtn.dataset.id));
+    return;
+  }
   const btn = ev.target.closest('button[data-act="view-version"]');
   if (!btn) return;
   try {

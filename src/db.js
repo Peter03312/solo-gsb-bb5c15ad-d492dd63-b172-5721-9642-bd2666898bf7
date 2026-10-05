@@ -170,6 +170,19 @@ CREATE TABLE IF NOT EXISTS rehearsal_interruptions (
   resumed_at    TEXT
 );
 
+-- 复盘封存（每版至多一条）：封存时把所见执行版复盘预览（明细 + 岗位汇总）作为不可变快照整体保存，
+-- 同时留存封存所依据的登记行版本与停排状态（basis）；封存后任何登记更正、交接、发布新版均不得改写。
+CREATE TABLE IF NOT EXISTS rehearsal_reviews (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id     INTEGER NOT NULL UNIQUE REFERENCES rehearsal_versions(id) ON DELETE CASCADE,
+  note           TEXT NOT NULL DEFAULT '',
+  detail_json    TEXT NOT NULL,             -- 封存时的逐项明细快照
+  summary_json   TEXT NOT NULL,             -- 封存时的岗位汇总与本版合计快照
+  basis_json     TEXT NOT NULL,             -- 封存核对依据：全部登记行版本 + 已结束停排段 + 执行版 id
+  sealed_by      TEXT NOT NULL,             -- 封存操作者（舞监）
+  sealed_at      TEXT NOT NULL              -- 封存时间
+);
+
 -- 签认时直接前置项登记行版本快照（任一变化即失效）
 CREATE TABLE IF NOT EXISTS release_signoff_preds (
   signoff_id  INTEGER NOT NULL REFERENCES release_signoffs(id) ON DELETE CASCADE,

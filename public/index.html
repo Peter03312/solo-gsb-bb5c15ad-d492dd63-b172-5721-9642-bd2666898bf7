@@ -167,6 +167,17 @@
           </p>
           <button id="whatif-open" class="primary" type="button">填写假设并重算预演…</button>
         </div>
+        <div class="panel" id="review-panel" hidden>
+          <h3>执行版复盘（舞监）</h3>
+          <p class="muted">
+            按<strong>冻结计划、现场登记与停排记录</strong>逐项复盘：实际开始相对计划的<strong>有符号分钟偏差</strong>、实际持续分钟及<strong>扣除停排后的净执行分钟</strong>
+            （只扣实际起止区间与<strong>已结束停排段</strong>的交集，重叠分钟只扣一次）。跳过、未开始、进行中及<strong>交接自旧版的完成项</strong>分别标识，不计入本版完成汇总；
+            未完成项的实际持续与净执行分钟为空。另按岗位汇总本版完成数、净执行分钟与开始偏差之和。
+            更正登记或恢复联排后重新打开预览即更新。确认无误后可<strong>封存复盘</strong>：携所见执行版、登记行版本与停排状态封存，任一依据变化整体拒绝；每版仅能封存一次，明细与汇总作为当时快照保存，此后不得改写。
+          </p>
+          <button id="review-open" class="primary" type="button">查看复盘预览…</button>
+          <span id="review-sealed-tag"></span>
+        </div>
         <div class="panel">
           <div class="table-wrap">
             <table>
@@ -212,7 +223,7 @@
         <div class="panel">
           <div class="table-wrap">
             <table>
-              <thead><tr><th>版本号</th><th>说明</th><th>发布时间</th><th>提示项</th><th>已有登记</th><th>已跳过</th><th>停排</th><th>操作</th></tr></thead>
+              <thead><tr><th>版本号</th><th>说明</th><th>发布时间</th><th>提示项</th><th>已有登记</th><th>已跳过</th><th>停排</th><th>复盘</th><th>操作</th></tr></thead>
               <tbody id="versions-tbody"></tbody>
             </table>
           </div>

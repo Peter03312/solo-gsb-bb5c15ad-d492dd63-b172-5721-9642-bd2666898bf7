@@ -181,6 +181,30 @@ npm start
 
 仅**当前执行版**可停排/恢复（携带过期 `versionId` 返回 409 `VERSION_ARCHIVED`）；时间格式错误、原因空等返回 400 `BAD_INPUT`。也可通过 HTTP API `POST /api/live/interruptions` 与 `POST /api/live/interruptions/resume` 办理（见第十四节示例）。
 
+#### 执行版复盘预览与封存（本轮新增）
+
+舞监在「现场联排」页点「**查看复盘预览…**」（复盘面板），对**当前执行版**按**冻结计划、现场登记与停排记录**逐项复盘：
+
+1. **逐项明细**：状态分别标识为**本版完成 / ↩ 交接自旧版完成 / 进行中 / 未开始 / 已跳过**；每个完成项列出：
+   - **开始偏差（有符号分钟）**＝实际开始 − 计划开始（正数晚开始、负数提前）；
+   - **实际持续分钟**＝实际完成 − 实际开始；
+   - **净执行分钟**＝实际持续 − 停排扣除分钟；
+   - **停排扣除**只计算「**实际起止区间**」与「**已结束停排段**」（半开 `[停排, 恢复)`）的交集；多段停排的重叠分钟**先求并集只扣一次**；进行中的停排尚未结束、不扣；恰在恢复时刻开始/结束的分钟按半开区间不扣；
+2. **不计入汇总的项**：**交接自旧版的完成项**（明细照列其偏差/持续，但净执行列显示「—」并标注来源版本）、**进行中、未开始、已跳过**均**不计入本版已完成汇总**；这四类项的**实际持续与净执行分钟为空**；
+3. **按岗位汇总**：仅统计本版完成项的**完成数、净执行分钟与开始偏差之和**，并给出本版合计与五类状态的计数；
+4. **预览随登记更新**：舞监**更正登记**或**恢复联排**后重新打开预览（或重新拉取）即得到最新明细；预览本身只读，不改动任何数据；
+5. **封存（每版一次）**：确认无误后填写可选备注并点「封存复盘」。浏览器把**预览所见的执行版 id、全部登记行版本与停排状态（已结束停排段 + 是否进行中）**作为依据一并提交，服务端在**同一事务内重新核对**：
+   - 执行版已被新版替代 → 409 `REVIEW_VERSION_STALE`（归档版不能封存，只能回看其已有快照）；
+   - 任一登记行版本已推进（岗位登记、舞监更正、跳过、停排清除预计结束等）或登记行集合变化 → 409 `REVIEW_BASIS_STALE`，响应逐项列出当前行版本；
+   - 停排段新增、恢复时刻变化、预览后进入/结束停排 → 409 `REVIEW_BASIS_STALE`，逐项说明；
+   - 缺依据 / 依据格式错误 → 400 `BAD_INPUT`；
+   - 任一依据变化均**整体拒绝**，不会写入快照；
+6. **封存后的不可变性**：封存成功后，**逐项明细与岗位汇总作为当时快照整体保存**（含操作者与时间）；**此后登记更正、发布交接或发布新版都不得改写该快照**；该版重复封存返回 409 `REVIEW_ALREADY_SEALED`；封存后舞监仍可按现有规则更正本版登记（实时明细会变，快照不变）；
+7. **历史版回看**：「发布版本」页每版新增「复盘」列与按钮，舞监可回看任意一版的**实时明细**与**已封存快照**（未封存时只显示实时明细并注明）；版本列表以 🔒 标出已封存版本及封存时间；
+8. **权限与无版本**：复盘预览 / 封存 / 历史回看**仅舞监**可调用（未登录 401，执行账号 403）；尚未发布任何版本时预览返回 409 `NO_LIVE_VERSION`，版本不存在时回看返回 404。
+
+也可通过 HTTP API 办理（见第十五节示例）：`GET /api/live/review`、`POST /api/live/review/seal`、`GET /api/versions/:id/review`。
+
 #### 双人放行签认（本轮新增）
 
 联排中有些提示项必须经**舞监与当班执行人双人放行**后才能开始：
@@ -213,7 +237,7 @@ npm start
 
 ### 已发布版本回看
 
-「发布版本」页列出全部历史版本（版本号、说明、发布时间、登记数量），点击「回看」查看该版本冻结的提示项、前置关系与当时/最新的现场重算结果；每行可点「来源」查看该版本下排期开始时刻的来源链（只读，与同一版本重算结果一致）；舞监还可在回看页查看每行的**更正记录**（更正前后值、操作者、时间、原因）与需放行项的**签认记录**（签认人、时间、目标与直接前置行版本快照、失效原因），归档版本为只读、不能更正或签认。
+「发布版本」页列出全部历史版本（版本号、说明、发布时间、登记数量、复盘封存标记），点击「回看」查看该版本冻结的提示项、前置关系与当时/最新的现场重算结果；每行可点「来源」查看该版本下排期开始时刻的来源链（只读，与同一版本重算结果一致）；舞监还可在回看页查看每行的**更正记录**（更正前后值、操作者、时间、原因）与需放行项的**签认记录**（签认人、时间、目标与直接前置行版本快照、失效原因），归档版本为只读、不能更正或签认。舞监点每版的「**复盘**」按钮可回看该版**实时明细与已封存复盘快照**（未封存时仅实时明细）。
 
 ### 版本号（乐观锁）规则
 
@@ -286,8 +310,11 @@ SESSION_SECRET=your-long-random-secret
 | GET | `/api/live/interruptions` | 已登录 | **联排中断记录**（当前执行版）：全部停排段（留痕，最新在前）与 `activeInterruption`（进行中或 null） |
 | POST | `/api/live/interruptions` | 舞监 | **停排**（仅当前执行版）：`{versionId, pauseText:"HH:MM", reason}`；同版已有进行中停排 409 `INTERRUPTION_EXISTS`；时刻不递增/覆盖已登记实际时刻 400；停排事务内清除未开始项预计结束（行版本+1、留痕）、有效双签整体失效 |
 | POST | `/api/live/interruptions/resume` | 舞监 | **恢复**（仅当前执行版）：`{versionId, resumeText:"HH:MM"}`；无进行中停排 409 `NO_ACTIVE_INTERRUPTION`；时刻不晚于停排/覆盖实际时刻 400；恢复后按中断顺延规则重算（实际登记时间不变） |
-| GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表（含 `skipCount`、**`interruptionCount` / `interruptionActive`**）与历史回看（每行含更正历史 `corrections`、跳过留痕 `skip`、放行签认 `release` 与**中断影响标注**，**版本含 `interruptions` 停排记录与 `activeInterruption`**，含全部签认记录 `release.records` 及失效原因，只读） |
+| GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表（含 `skipCount`、**`interruptionCount` / `interruptionActive`、`reviewSealed` / `reviewSealedAt` 复盘封存标记**）与历史回看（每行含更正历史 `corrections`、跳过留痕 `skip`、放行签认 `release` 与**中断影响标注**，**版本含 `interruptions` 停排记录与 `activeInterruption`**，含全部签认记录 `release.records` 及失效原因，只读） |
 | GET | `/api/versions/:id/cues/:cueRef/explain` | 已登录 | **排期开始来源解释**（当前执行版与历史版本通用，只读）：以原计划开始为基线，达到最终最大约束时刻的直接前置全部列出并逐层追溯来源；目标已开始/已完成/已跳过返回明确说明 |
+| GET | `/api/live/review` | 舞监 | **当前执行版复盘实时预览**：逐项状态（本版完成 / 交接自旧版完成 / 进行中 / 未开始 / 已跳过）、开始有符号偏差、实际持续分钟、停排扣除分钟、净执行分钟，及按岗位汇总与封存依据 `basis`；无版本 409 `NO_LIVE_VERSION` |
+| POST | `/api/live/review/seal` | 舞监 | **封存当前执行版复盘**：`{versionId, note?, basis}`（basis 取自预览，含全部登记行版本与停排状态）；任一依据变化 409 `REVIEW_BASIS_STALE` 整体拒绝，归档版 409 `REVIEW_VERSION_STALE`，每版重复封存 409 `REVIEW_ALREADY_SEALED`；明细与汇总作为不可改写快照保存 |
+| GET | `/api/versions/:id/review` | 舞监 | **历史版复盘回看**：该版实时明细 `live` 与已封存快照 `snapshot`（未封存为 null），并带封存依据与封存信息 |
 
 ## 八、登记交接 API 调用示例
 
@@ -1113,3 +1140,146 @@ curl -b sm.cookie -s http://localhost:3000/api/versions/1
 | 无进行中停排却恢复 | 409 | `NO_ACTIVE_INTERRUPTION` |
 | 停排期间执行登记 / 新签认 / 发布新版 | 409 | `INTERRUPTION_ACTIVE` |
 | 对归档版本停排 / 恢复 / 携带过期 versionId | 409 | `VERSION_ARCHIVED` |
+
+## 十五、执行版复盘 API 调用示例（本轮新增）
+
+以本地默认端口 3000、舞监账号为例（`curl -c/-b` 复用会话 Cookie）。仅舞监可调用；当前执行版可预览与封存，历史版可回看实时明细与已封存快照。
+
+### 1. 查看当前执行版复盘预览（只读）
+
+```bash
+curl -c sm.cookie -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"sm","password":"sm12345"}'
+
+curl -b sm.cookie -s http://localhost:3000/api/live/review
+```
+
+响应包含实时明细 `live`、封存依据 `basis` 与封存状态 `sealed`（未封存为 null）：
+
+```json
+{
+  "versionId": 1, "versionNo": 1, "isLatest": true,
+  "live": {
+    "cues": [
+      { "cueRef": 1, "code": "L1", "title": "开场灯光就位", "position": "灯光",
+        "plannedStartText": "19:00", "plannedEndText": "19:05", "plannedDuration": 5,
+        "status": "DONE", "statusLabel": "本版完成",
+        "actualStartText": "19:00", "actualEndText": "19:04",
+        "startDeltaMinutes": 0, "actualDurationMinutes": 4,
+        "deductedPauseMinutes": 0, "netDurationMinutes": 4,
+        "rowVer": 3, "handover": null, "countedInSummary": true },
+      { "cueRef": 3, "code": "P1", "title": "一桌二椅", "position": "道具",
+        "status": "DONE", "actualStartText": "19:04", "actualEndText": "19:12",
+        "startDeltaMinutes": -1, "actualDurationMinutes": 8,
+        "deductedPauseMinutes": 4, "netDurationMinutes": 4, "countedInSummary": true },
+      { "cueRef": 4, "code": "L2", "status": "RUNNING",
+        "startDeltaMinutes": null, "actualDurationMinutes": null, "netDurationMinutes": null },
+      { "cueRef": 2, "code": "S1", "status": "PENDING",
+        "startDeltaMinutes": null, "actualDurationMinutes": null, "netDurationMinutes": null },
+      { "cueRef": 6, "code": "L3", "status": "SKIPPED",
+        "startDeltaMinutes": null, "actualDurationMinutes": null, "netDurationMinutes": null }
+    ],
+    "positions": [
+      { "position": "灯光", "doneCount": 1, "netDurationMinutes": 4, "startDeltaSum": 0 },
+      { "position": "道具", "doneCount": 1, "netDurationMinutes": 4, "startDeltaSum": -1 }
+    ],
+    "totals": { "doneCount": 2, "netDurationMinutes": 8, "startDeltaSum": -1 },
+    "counts": { "total": 6, "done": 2, "doneHandover": 0, "running": 1, "pending": 2, "skipped": 1 }
+  },
+  "basis": {
+    "versionId": 1,
+    "rows": [ { "cueRef": 1, "rowVersion": 3 }, { "cueRef": 2, "rowVersion": 1 } ],
+    "closedInterruptions": [ { "id": 1, "pauseText": "19:05", "resumeText": "19:09" } ],
+    "activePause": null
+  },
+  "sealed": null
+}
+```
+
+字段约定：
+
+- `status`：`DONE` 本版完成；`DONE_HANDOVER` 交接自旧版完成（带 `handover.sourceVersionNo/sourceCode`，`countedInSummary=false`，净执行为 null）；`RUNNING` 进行中；`PENDING` 未开始；`SKIPPED` 已跳过；
+- `startDeltaMinutes` 为**有符号**偏差（晚开始为正）；仅完成项（含交接完成）有值，其余状态为 null；
+- `netDurationMinutes` 仅**本版完成**项有值＝实际持续 − 实际区间与已结束停排段（半开）交集分钟（重叠分钟只扣一次）；交接完成 / 进行中 / 未开始 / 已跳过均为 null；
+- `positions` 与 `totals` 只统计本版完成项；`counts` 给出五类状态计数。
+
+### 2. 携预览依据封存复盘
+
+把上一步响应中的 `basis` **原样回传**（`rows` 也可放在顶层），可选附 200 字内备注：
+
+```bash
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/review/seal \
+  -H 'Content-Type: application/json' -d '{
+    "versionId": 1,
+    "note": "首场联排复盘",
+    "basis": {
+      "versionId": 1,
+      "rows": [ {"cueRef": 1, "rowVersion": 3}, {"cueRef": 2, "rowVersion": 1},
+                {"cueRef": 3, "rowVersion": 3}, {"cueRef": 4, "rowVersion": 1},
+                {"cueRef": 5, "rowVersion": 1}, {"cueRef": 6, "rowVersion": 2} ],
+      "closedInterruptions": [ {"id": 1, "pauseText": "19:05", "resumeText": "19:09"} ],
+      "activePause": null
+    }
+  }'
+```
+
+成功返回 **201**，负载与 `GET /api/live/review` 同构，且 `sealed` 变为封存信息：
+
+```json
+{ "versionId": 1, "versionNo": 1, "isLatest": true,
+  "live": { "…": "封存时刻的实时明细（同时已固化为快照）" },
+  "basis": { "…": "封存核对依据" },
+  "sealed": { "note": "首场联排复盘", "sealedBy": "舞监", "sealedAt": "2026-10-05 21:02:11" } }
+```
+
+### 3. 依据变化 / 重复封存 / 归档版：整体拒绝
+
+```json
+HTTP 409
+{
+  "error": "REVIEW_BASIS_STALE",
+  "message": "封存依据已变化（1 项登记行），本次封存已整体拒绝，请刷新预览后再封存",
+  "items": [
+    { "cueRef": 1, "code": "L1", "previewRowVersion": 3, "currentRowVersion": 4,
+      "reason": "「L1」登记行版本已变化（预览时 v3，当前 v4，可能被登记更正、岗位登记或停排更新），请重新打开预览后再封存" }
+  ]
+}
+```
+
+| 场景 | 状态码 | error |
+| --- | --- | --- |
+| 未登录 / 执行账号调用复盘接口 | 401 / 403 | `UNAUTHORIZED` / `FORBIDDEN` |
+| 尚未发布任何版本时预览 | 409 | `NO_LIVE_VERSION` |
+| 版本不存在（封存 / 回看） | 404 | `NOT_FOUND` |
+| 缺 `basis` / `rows`、行内缺 cueRef/rowVersion、重复 cueRef、备注超长 | 400 | `BAD_INPUT` |
+| 任一登记行版本推进 / 行集合变化 | 409 | `REVIEW_BASIS_STALE`（`items` 逐项给出当前版本） |
+| 停排段新增 / 时刻变化 / 预览后进入或结束停排 | 409 | `REVIEW_BASIS_STALE`（逐项说明） |
+| 归档版本（已有更新版）再封存 | 409 | `REVIEW_VERSION_STALE` |
+| 同一版本重复封存 | 409 | `REVIEW_ALREADY_SEALED` |
+
+### 4. 历史版回看：实时明细 + 已封存快照
+
+```bash
+curl -b sm.cookie -s http://localhost:3000/api/versions/1/review
+```
+
+```json
+{
+  "versionId": 1, "versionNo": 1, "isLatest": false,
+  "live": { "cues": ["…该版当前实时明细（封存后的更正会反映在这里）…"], "positions": [], "totals": {}, "counts": {} },
+  "basis": { "…": "当前依据（仅展示）" },
+  "sealed": { "note": "首场联排复盘", "sealedBy": "舞监", "sealedAt": "2026-10-05 21:02:11" },
+  "snapshot": {
+    "note": "首场联排复盘", "sealedBy": "舞监", "sealedAt": "2026-10-05 21:02:11",
+    "detail": [ "…封存当时逐项明细，此后任何更正 / 交接 / 发布新版均不改写…" ],
+    "summary": { "versionId": 1, "versionNo": 1,
+      "counts": { "total": 6, "done": 2, "doneHandover": 0, "running": 1, "pending": 2, "skipped": 1 },
+      "positions": [], "totals": { "doneCount": 2, "netDurationMinutes": 8, "startDeltaSum": -1 } },
+    "basis": { "…": "封存时核对通过的依据快照" }
+  }
+}
+```
+
+- 未封存的版本 `snapshot` 为 `null`；封存后即便舞监继续更正该版登记，`snapshot.detail / summary` 仍保持封存时刻内容，`live` 显示最新实时明细；
+- 版本列表 `GET /api/versions` 每项带 `reviewSealed`（布尔）与 `reviewSealedAt`。

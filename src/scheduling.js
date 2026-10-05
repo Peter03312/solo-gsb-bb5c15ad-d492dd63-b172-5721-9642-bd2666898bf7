@@ -636,7 +636,157 @@ function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions)
   };
 }
 
+/**
+ * 复盘计算（只读）：按冻结计划、现场登记与停排记录逐项给出执行复盘。
+ *
+ * 入参与 computeLive 相同（publishedCues / deps / regMap / interruptions）。
+ * deps 仅用于保持入参一致（复盘本身不重算排期，实际开始相对计划的偏差直接用登记值）。
+ *
+ * 逐项结论：
+ * - DONE         本版完成（本版登记同时有实际开始与实际完成，且不是交接自旧版的完成项）
+ * - DONE_HANDOVER 交接自旧版的完成项（实际开始/完成随发布交接带入）：单独标识，不计入本版完成汇总
+ * - SKIPPED      已跳过
+ * - RUNNING      进行中（有实际开始、无实际完成）
+ * - PENDING      未开始（无实际开始、无实际完成、未跳过）
+ *
+ * 完成项给出：
+ * - startDeltaMinutes  实际开始相对计划开始的有符号分钟偏差（正=晚开始，负=提前）
+ * - actualDurationMinutes    实际持续分钟（实际完成 - 实际开始）
+ * - netDurationMinutes       扣除停排后的净执行分钟
+ * 净执行只扣「实际起止区间」与「已结束停排段」（半开 [pause, resume)）的交集；
+ * 多段停排重叠分钟只扣一次（先求并集再与实际区间相交）。进行中的停排不扣（尚未结束）。
+ * 未完成项（跳过 / 进行中 / 未开始）实际持续与净执行分钟为空。
+ *
+ * 返回 { cues: [...], positions: [...], totals: {...}, counts: {...} }
+ */
+function computeReview(publishedCues, deps, regMap, interruptions) {
+  // 已结束停排段（进行中的停排无恢复时刻，不扣净执行）
+  const closed = (interruptions || [])
+    .filter((s) => s.resumeMinute !== null && s.resumeMinute !== undefined)
+    .map((s) => ({ start: s.pauseMinute, end: s.resumeMinute }))
+    .filter((s) => s.end > s.start)
+    .sort((a, b) => a.start - b.start);
+
+  // 停排段求并集（多段重叠/相接的分钟只扣一次）
+  const merged = [];
+  for (const seg of closed) {
+    const last = merged[merged.length - 1];
+    if (last && seg.start <= last.end) {
+      last.end = Math.max(last.end, seg.end);
+    } else {
+      merged.push({ start: seg.start, end: seg.end });
+    }
+  }
+
+  // [aStart, aEnd) 与已结束停排并集的交集分钟数
+  const deductedMinutes = (aStart, aEnd) => {
+    let n = 0;
+    for (const s of merged) {
+      const lo = Math.max(aStart, s.start);
+      const hi = Math.min(aEnd, s.end);
+      if (lo < hi) n += hi - lo;
+    }
+    return n;
+  };
+
+  // 按岗位聚合（仅本版完成项计入）：完成数、净执行分钟、开始偏差之和
+  const posMap = new Map();
+  const ensurePos = (position) => {
+    if (!posMap.has(position)) {
+      posMap.set(position, { position, doneCount: 0, netDurationMinutes: 0, startDeltaSum: 0 });
+    }
+    return posMap.get(position);
+  };
+
+  const sources = new Map();
+  for (const [ref, r] of regMap.entries()) sources.set(ref, r);
+
+  const cues = publishedCues
+    .slice()
+    .sort((a, b) => a.plannedStart - b.plannedStart || a.id - b.id)
+    .map((cue) => {
+      const r = sources.get(cue.id) || {};
+      const as = r.actualStart ?? null;
+      const ae = r.actualEnd ?? null;
+      const skipped = r.skipped === true || r.skipped === 1;
+      const handover = r.sourceVersionId != null;
+
+      let status;
+      if (skipped) status = 'SKIPPED';
+      else if (ae !== null && as !== null) status = handover ? 'DONE_HANDOVER' : 'DONE';
+      else if (as !== null) status = 'RUNNING';
+      else status = 'PENDING';
+
+      const base = {
+        cueRef: cue.id,
+        code: cue.code,
+        title: cue.title,
+        position: cue.position,
+        plannedStart: cue.plannedStart,
+        plannedStartText: minToTime(cue.plannedStart),
+        plannedEndText: minToTime(cue.plannedStart + cue.duration),
+        plannedDuration: cue.duration,
+        status,
+        actualStart: as,
+        actualStartText: minToTime(as),
+        actualEnd: ae,
+        actualEndText: minToTime(ae),
+        rowVer: r.rowVer ?? 1,
+        handover: handover
+          ? { sourceVersionId: r.sourceVersionId, sourceCueRef: r.sourceCueRef }
+          : null,
+      };
+
+      const isDoneThisVersion = status === 'DONE';
+      if (!isDoneThisVersion && status !== 'DONE_HANDOVER') {
+        // 跳过 / 进行中 / 未开始：实际持续与净执行分钟为空
+        return {
+          ...base,
+          startDeltaMinutes: null,
+          actualDurationMinutes: null,
+          netDurationMinutes: null,
+          deductedPauseMinutes: null,
+          countedInSummary: false,
+        };
+      }
+
+      const actualDuration = ae - as;
+      const deducted = isDoneThisVersion ? deductedMinutes(as, ae) : 0;
+      const item = {
+        ...base,
+        startDeltaMinutes: as - cue.plannedStart,
+        actualDurationMinutes: actualDuration,
+        netDurationMinutes: isDoneThisVersion ? actualDuration - deducted : null,
+        deductedPauseMinutes: deducted,
+        countedInSummary: isDoneThisVersion,
+      };
+      if (isDoneThisVersion) {
+        const p = ensurePos(cue.position);
+        p.doneCount += 1;
+        p.netDurationMinutes += item.netDurationMinutes;
+        p.startDeltaSum += item.startDeltaMinutes;
+      }
+      return item;
+    });
+
+  const positions = [...posMap.values()].sort((a, b) => a.position.localeCompare(b.position, 'zh-Hans-CN'));
+  const totals = {
+    doneCount: positions.reduce((n, p) => n + p.doneCount, 0),
+    netDurationMinutes: positions.reduce((n, p) => n + p.netDurationMinutes, 0),
+    startDeltaSum: positions.reduce((n, p) => n + p.startDeltaSum, 0),
+  };
+  const counts = {
+    total: cues.length,
+    done: cues.filter((c) => c.status === 'DONE').length,
+    doneHandover: cues.filter((c) => c.status === 'DONE_HANDOVER').length,
+    running: cues.filter((c) => c.status === 'RUNNING').length,
+    pending: cues.filter((c) => c.status === 'PENDING').length,
+    skipped: cues.filter((c) => c.status === 'SKIPPED').length,
+  };
+  return { cues, positions, totals, counts };
+}
+
 module.exports = {
   timeToMin, minToTime, topoAnalyze, validatePlan, computeLive, explainSchedule, simulateWhatIf,
-  runningEndShift, interruptionHoldMinute,
+  computeReview, runningEndShift, interruptionHoldMinute,
 };

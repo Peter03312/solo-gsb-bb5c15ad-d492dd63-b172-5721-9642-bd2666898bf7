@@ -9,7 +9,7 @@ const session = require('express-session');
 const { db, getMeta, setMeta } = require('./db');
 const { verifyPassword } = require('./auth');
 const { init } = require('./initdb');
-const { timeToMin, minToTime, validatePlan, computeLive, topoAnalyze, explainSchedule, simulateWhatIf } = require('./scheduling');
+const { timeToMin, minToTime, validatePlan, computeLive, topoAnalyze, explainSchedule, simulateWhatIf, computeReview } = require('./scheduling');
 
 init();
 
@@ -954,7 +954,9 @@ app.get('/api/versions', requireAuth, (req, res, next) => {
               (SELECT COUNT(*) FROM registrations r WHERE r.version_id = v.id AND r.skipped = 1) AS skip_count,
               (SELECT COUNT(*) FROM rehearsal_interruptions i WHERE i.version_id = v.id) AS interruption_count,
               (SELECT COUNT(*) FROM rehearsal_interruptions i WHERE i.version_id = v.id AND i.resume_minute IS NULL) AS interruption_active_count,
-              (SELECT COUNT(*) FROM published_cues p WHERE p.version_id = v.id) AS cue_count
+              (SELECT COUNT(*) FROM published_cues p WHERE p.version_id = v.id) AS cue_count,
+              (SELECT COUNT(*) FROM rehearsal_reviews rv WHERE rv.version_id = v.id) AS review_sealed,
+              (SELECT rv.sealed_at FROM rehearsal_reviews rv WHERE rv.version_id = v.id) AS review_sealed_at
        FROM rehearsal_versions v ORDER BY v.version_no DESC`
     ).all();
     res.json({
@@ -964,6 +966,8 @@ app.get('/api/versions', requireAuth, (req, res, next) => {
         interruptionCount: r.interruption_count,
         interruptionActive: r.interruption_active_count > 0,
         cueCount: r.cue_count,
+        reviewSealed: r.review_sealed > 0,
+        reviewSealedAt: r.review_sealed_at || null,
       })),
     });
   } catch (e) { next(e); }
@@ -2104,6 +2108,272 @@ app.get('/api/live/interruptions', requireAuth, (req, res, next) => {
       interruptions: rows.map(interruptionJson),
     });
   } catch (e) { next(e); }
+});
+
+// ---------- 舞监：执行版复盘（实时预览 + 封存快照） ----------
+
+const REVIEW_STATUS_LABELS = {
+  DONE: '本版完成',
+  DONE_HANDOVER: '交接自旧版完成',
+  RUNNING: '进行中',
+  PENDING: '未开始',
+  SKIPPED: '已跳过',
+};
+
+// 实时复盘明细：按冻结计划、现场登记与停排记录逐项计算（只读）。
+// sourceVersionNo/sourceCode 用于交接自旧版完成项的来源标注。
+function buildReviewLive(ver) {
+  const { cues, deps, regMap, interruptions } = versionInputs(ver.id);
+  const review = computeReview(cues, deps, regMap, interruptions);
+
+  const sourceRefs = review.cues
+    .filter((c) => c.handover)
+    .map((c) => ({ svid: c.handover.sourceVersionId, sref: c.handover.sourceCueRef }));
+  const sourceVerNo = new Map();
+  const sourceCode = new Map();
+  if (sourceRefs.length) {
+    const vIds = [...new Set(sourceRefs.map((s) => s.svid))];
+    db.prepare(
+      `SELECT id, version_no FROM rehearsal_versions WHERE id IN (${vIds.map(() => '?').join(',')})`
+    ).all(...vIds).forEach((v) => sourceVerNo.set(v.id, v.version_no));
+    const q = db.prepare('SELECT code FROM published_cues WHERE version_id = ? AND cue_ref = ?');
+    for (const s of sourceRefs) {
+      const row = q.get(s.svid, s.sref);
+      sourceCode.set(`${s.svid}:${s.sref}`, row ? row.code : null);
+    }
+  }
+
+  const closedInterruptions = interruptions
+    .filter((it) => it.resumeMinute !== null)
+    .map((it) => ({ id: it.id, pauseText: minToTime(it.pauseMinute), resumeText: minToTime(it.resumeMinute), durationMinutes: it.resumeMinute - it.pauseMinute }));
+
+  return {
+    review: {
+      cues: review.cues.map((c) => ({
+        ...c,
+        statusLabel: REVIEW_STATUS_LABELS[c.status] || c.status,
+        handover: c.handover ? {
+          sourceVersionId: c.handover.sourceVersionId,
+          sourceVersionNo: sourceVerNo.get(c.handover.sourceVersionId) ?? null,
+          sourceCueRef: c.handover.sourceCueRef,
+          sourceCode: sourceCode.get(`${c.handover.sourceVersionId}:${c.handover.sourceCueRef}`) ?? c.code,
+        } : null,
+      })),
+      positions: review.positions,
+      totals: review.totals,
+      counts: review.counts,
+    },
+    // 封存核对依据：全部登记行版本 + 已结束停排段（进行中的停排不是扣减依据）
+    basis: {
+      versionId: ver.id,
+      rows: review.cues
+        .map((c) => ({ cueRef: c.cueRef, rowVersion: c.rowVer }))
+        .sort((a, b) => a.cueRef - b.cueRef),
+      closedInterruptions: closedInterruptions
+        .map((it) => ({ id: it.id, pauseText: it.pauseText, resumeText: it.resumeText }))
+        .sort((a, b) => a.id - b.id),
+      activePause: interruptions.some((it) => it.resumeMinute === null)
+        ? (() => { const a = interruptions.find((it) => it.resumeMinute === null); return { id: a.id, pauseText: minToTime(a.pauseMinute) }; })()
+        : null,
+    },
+  };
+}
+
+// 封存快照 JSON 反序列化（容错）
+function reviewSnapshotJson(row) {
+  const parse = (s) => { try { return JSON.parse(s); } catch { return null; } };
+  return {
+    id: row.id,
+    versionId: row.version_id,
+    note: row.note,
+    sealedBy: row.sealed_by,
+    sealedAt: row.sealed_at,
+    detail: parse(row.detail_json),
+    summary: parse(row.summary_json),
+    basis: parse(row.basis_json),
+  };
+}
+
+function reviewEnvelope(ver) {
+  const latest = latestPublishedVersion();
+  const isLatest = !!latest && latest.id === ver.id;
+  const { review, basis } = buildReviewLive(ver);
+  const snapRow = db.prepare('SELECT * FROM rehearsal_reviews WHERE version_id = ?').get(ver.id);
+  return {
+    versionId: ver.id,
+    versionNo: ver.version_no,
+    isLatest,
+    live: review,
+    basis,
+    sealed: snapRow ? (() => { const s = reviewSnapshotJson(snapRow); return { note: s.note, sealedBy: s.sealedBy, sealedAt: s.sealedAt }; })() : null,
+  };
+}
+
+// 实时复盘预览（仅舞监；当前执行版）：登记更正或停排/恢复后重取即随之更新
+app.get('/api/live/review', requireSM, (req, res, next) => {
+  try {
+    const ver = latestPublishedVersion();
+    if (!ver) throw new ApiError(409, 'NO_LIVE_VERSION', '尚未发布任何联排版本，没有可复盘的执行版');
+    res.json(reviewEnvelope(ver));
+  } catch (e) { next(e); }
+});
+
+// 指定版本复盘回看（仅舞监，历史版与当前执行版通用）：实时明细 + 已封存快照（若有）
+app.get('/api/versions/:id/review', requireSM, (req, res, next) => {
+  try {
+    const ver = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(Number(req.params.id));
+    if (!ver) throw new ApiError(404, 'NOT_FOUND', '版本不存在');
+    const envelope = reviewEnvelope(ver);
+    const snapRow = db.prepare('SELECT * FROM rehearsal_reviews WHERE version_id = ?').get(ver.id);
+    if (snapRow) {
+      const s = reviewSnapshotJson(snapRow);
+      envelope.sealed = { note: s.note, sealedBy: s.sealedBy, sealedAt: s.sealedAt };
+      envelope.snapshot = { note: s.note, sealedBy: s.sealedBy, sealedAt: s.sealedAt,
+        detail: s.detail, summary: s.summary, basis: s.basis };
+    } else {
+      envelope.snapshot = null;
+    }
+    res.json(envelope);
+  } catch (e) { next(e); }
+});
+
+// 封存复盘：舞监携预览所见的执行版、全部登记行版本与停排状态封存；
+// 任一依据变化（执行版被新版替代、任一登记行版本推进、停排段新增/恢复）整体拒绝。
+// 每版仅能封存一次；明细与汇总作为当时快照保存，此后登记更正、交接或发布新版不得改写。
+app.post('/api/live/review/seal', requireSM, (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const versionId = Number(body.versionId);
+    if (!Number.isInteger(versionId)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的 versionId');
+    const note = String(body.note || '').trim();
+    if (note.length > 200) throw new ApiError(400, 'BAD_INPUT', '复盘备注不能超过 200 字');
+
+    const rawRows = body.rows;
+    const rawBasis = body.basis;
+    // 兼容两种提交：rows 在顶层或封装在 basis 内
+    const rowsSrc = Array.isArray(rawRows) ? rawRows : rawBasis?.rows;
+    if (!Array.isArray(rowsSrc)) {
+      throw new ApiError(400, 'BAD_INPUT', '请携带预览所见的全部登记行版本 rows: [{cueRef, rowVersion}]');
+    }
+    const submittedRows = new Map();
+    for (const it of rowsSrc) {
+      const cueRef = Number(it?.cueRef);
+      const rowVersion = Number(it?.rowVersion);
+      if (!Number.isInteger(cueRef) || !Number.isInteger(rowVersion)) {
+        throw new ApiError(400, 'BAD_INPUT', '封存依据每行须包含整数 cueRef 与 rowVersion，请重新打开预览后再封存');
+      }
+      if (submittedRows.has(cueRef)) throw new ApiError(400, 'BAD_INPUT', `封存依据中提示项引用 ${cueRef} 重复`);
+      submittedRows.set(cueRef, rowVersion);
+    }
+    const submittedClosed = new Map();
+    for (const it of (rawBasis?.closedInterruptions || [])) {
+      const id = Number(it?.id);
+      if (!Number.isInteger(id)) throw new ApiError(400, 'BAD_INPUT', '封存依据的停排段 id 无效');
+      submittedClosed.set(id, { pauseText: String(it.pauseText || ''), resumeText: String(it.resumeText || '') });
+    }
+    const submittedActivePauseId = rawBasis?.activePause ? Number(rawBasis.activePause.id) : null;
+
+    const result = db.transaction(() => {
+      const ver = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+      if (!ver) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+      const latest = latestPublishedVersion();
+      if (!latest || latest.id !== ver.id) {
+        throw new ApiError(409, 'REVIEW_VERSION_STALE',
+          `第 ${ver.version_no} 版已不是当前执行版本（当前为第 ${latest ? latest.version_no : '?'} 版），不能再封存该版复盘；历史版可回看其已封存快照`,
+          { currentVersionId: latest ? latest.id : null });
+      }
+      const existing = db.prepare('SELECT id FROM rehearsal_reviews WHERE version_id = ?').get(ver.id);
+      if (existing) {
+        throw new ApiError(409, 'REVIEW_ALREADY_SEALED',
+          `第 ${ver.version_no} 版复盘已封存，每版仅能封存一次；明细与汇总已作为当时快照保存，不能再次封存或改写`);
+      }
+
+      const { review, basis } = buildReviewLive(ver);
+
+      // 1) 登记行依据：集合必须一致，版本必须逐一相等（登记更正、岗位登记、跳过、停排清除预计结束都会推进）
+      const rowIssues = [];
+      if (submittedRows.size !== basis.rows.length) {
+        rowIssues.push({ cueRef: null, code: null,
+          reason: `预览依据的登记行数量（${submittedRows.size}）与当前版本（${basis.rows.length}）不一致，请重新打开预览后再封存` });
+      }
+      for (const b of basis.rows) {
+        const seen = submittedRows.get(b.cueRef);
+        if (seen === undefined) {
+          const code = review.cues.find((c) => c.cueRef === b.cueRef)?.code || `#${b.cueRef}`;
+          rowIssues.push({ cueRef: b.cueRef, code, reason: `「${code}」不在封存依据中，请重新打开预览后再封存` });
+        } else if (seen !== b.rowVersion) {
+          const code = review.cues.find((c) => c.cueRef === b.cueRef)?.code || `#${b.cueRef}`;
+          rowIssues.push({ cueRef: b.cueRef, code, previewRowVersion: seen, currentRowVersion: b.rowVersion,
+            reason: `「${code}」登记行版本已变化（预览时 v${seen}，当前 v${b.rowVersion}，可能被登记更正、岗位登记或停排更新），请重新打开预览后再封存` });
+        }
+      }
+      for (const cueRef of submittedRows.keys()) {
+        if (!basis.rows.some((b) => b.cueRef === cueRef)) {
+          rowIssues.push({ cueRef, code: null, reason: `提示项引用 ${cueRef} 已不在当前执行版中，请重新打开预览后再封存` });
+        }
+      }
+      if (rowIssues.length) {
+        throw new ApiError(409, 'REVIEW_BASIS_STALE',
+          `封存依据已变化（${rowIssues.length} 项登记行），本次封存已整体拒绝，请刷新预览后再封存`,
+          { items: rowIssues });
+      }
+
+      // 2) 停排依据：已结束停排段集合与每段时刻必须一致；进行中停排状态必须一致
+      const pauseIssues = [];
+      if (submittedClosed.size !== basis.closedInterruptions.length) {
+        pauseIssues.push(`已结束停排段数量变化（预览时 ${submittedClosed.size} 段，当前 ${basis.closedInterruptions.length} 段）`);
+      }
+      for (const cur of basis.closedInterruptions) {
+        const seen = submittedClosed.get(cur.id);
+        if (!seen) {
+          pauseIssues.push(`预览后新增了停排段 ${cur.pauseText}–${cur.resumeText}`);
+        } else if (seen.pauseText !== cur.pauseText || seen.resumeText !== cur.resumeText) {
+          pauseIssues.push(`停排段 ${cur.pauseText}–${cur.resumeText} 的时刻与预览所见（${seen.pauseText}–${seen.resumeText}）不一致`);
+        }
+      }
+      for (const [id, seen] of submittedClosed) {
+        if (!basis.closedInterruptions.some((c) => c.id === id)) {
+          pauseIssues.push(`预览所见停排段（${seen.pauseText}–${seen.resumeText}）已不存在`);
+        }
+      }
+      const currentActiveId = basis.activePause ? basis.activePause.id : null;
+      if ((submittedActivePauseId ?? null) !== (currentActiveId ?? null)) {
+        pauseIssues.push(currentActiveId
+          ? `预览后联排已进入停排（${basis.activePause.pauseText} 起），停排状态已变化`
+          : '预览后联排已恢复停排，停排状态已变化');
+      }
+      if (pauseIssues.length) {
+        throw new ApiError(409, 'REVIEW_BASIS_STALE',
+          `封存依据中的停排状态已变化（${pauseIssues.length} 项），本次封存已整体拒绝，请刷新预览后再封存`,
+          { items: pauseIssues.map((reason) => ({ reason })) });
+      }
+
+      const stamp = new Date().toLocaleString('sv-SE'); // YYYY-MM-DD HH:MM:SS
+      const actor = req.session.user.displayName;
+      // 明细与汇总作为当时快照整体保存（此后登记更正、交接或发布新版均不得改写）
+      const detail = review.cues;
+      const summary = {
+        versionId: ver.id,
+        versionNo: ver.version_no,
+        counts: review.counts,
+        positions: review.positions,
+        totals: review.totals,
+      };
+      db.prepare(
+        `INSERT INTO rehearsal_reviews(version_id, note, detail_json, summary_json, basis_json, sealed_by, sealed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`
+      ).run(ver.id, note, JSON.stringify(detail), JSON.stringify(summary), JSON.stringify(basis), actor, stamp);
+      return { ver, stamp, actor };
+    })();
+
+    res.status(201).json(reviewEnvelope(result.ver));
+  } catch (e) {
+    if (String(e.code || '').includes('SQLITE_CONSTRAINT_UNIQUE')
+        || String(e.message || '').includes('UNIQUE constraint failed: rehearsal_reviews.version_id')) {
+      return next(new ApiError(409, 'REVIEW_ALREADY_SEALED', '该版复盘已封存，每版仅能封存一次，快照不可改写'));
+    }
+    next(e);
+  }
 });
 
 // ---------- 静态页面与错误处理 ----------
