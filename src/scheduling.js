@@ -636,7 +636,150 @@ function simulateWhatIf(publishedCues, deps, regMap, assumptions, interruptions)
   };
 }
 
+// ---------- 执行版复盘：逐项偏差 / 实际持续 / 扣除停排后的净执行分钟 ----------
+
+const RETRO_STATUS_LABEL = {
+  DONE: '本版完成',
+  DONE_HANDOVER: '交接完成',
+  RUNNING: '进行中',
+  PENDING: '未开始',
+  SKIPPED: '跳过',
+};
+
+// 多个半开区间 [start, end) 的并集总分钟数（先合并再求和，重叠分钟只计一次）
+function unionLength(intervals) {
+  const valid = intervals
+    .map(([a, b]) => [a, b])
+    .filter(([a, b]) => Number.isFinite(a) && Number.isFinite(b) && b > a)
+    .sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  let total = 0;
+  let cur = null;
+  for (const [a, b] of valid) {
+    if (!cur) { cur = [a, b]; continue; }
+    if (a <= cur[1]) cur[1] = Math.max(cur[1], b); // 相接或重叠都合并
+    else { total += cur[1] - cur[0]; cur = [a, b]; }
+  }
+  if (cur) total += cur[1] - cur[0];
+  return total;
+}
+
+/**
+ * 执行版复盘明细（纯计算，全部使用分钟数）。
+ * 依据：冻结计划（publishedCues/deps）、现场登记（regMap：含跳过与交接来源标记）、停排记录（interruptions）。
+ *
+ * 逐项分类：
+ * - DONE           本版完成（实际开始+实际完成，且非交接来源）：计入本版已完成汇总
+ * - DONE_HANDOVER  交接自旧版的完成项（sourceVersionId 非空）：单独标识，不计入本版汇总
+ * - RUNNING        进行中（有实际开始、无实际完成、未跳过）
+ * - PENDING        未开始
+ * - SKIPPED        跳过
+ *
+ * 指标：
+ * - startDelta  实际开始相对计划开始的有符号分钟偏差（实际 - 计划；负=提前）；非空实际开始才有
+ * - actualMinutes 实际持续 = 实际完成 - 实际开始；未完成（RUNNING/PENDING/SKIPPED）为 null
+ * - netMinutes  净执行分钟 = 实际持续 - 实际起止区间与「已结束停排段」交集的并集分钟
+ *               （重叠分钟只扣一次）；进行中停排因恢复时刻未定，不参与扣除；未完成为 null
+ */
+function buildRetrospective(publishedCues, deps, regMap, interruptions) {
+  // 已结束停排段（恢复时刻已登记）；进行中的停排不进入净执行扣除（恢复时刻未知）
+  const endedPauses = (interruptions || [])
+    .filter((s) => s.resumeMinute !== null && s.resumeMinute !== undefined)
+    .map((s) => ({ pauseMinute: s.pauseMinute, resumeMinute: s.resumeMinute, reason: s.reason }));
+  const activePause = (interruptions || [])
+    .find((s) => s.resumeMinute === null || s.resumeMinute === undefined) || null;
+
+  const items = publishedCues
+    .slice()
+    .sort((a, b) => a.plannedStart - b.plannedStart || a.id - b.id)
+    .map((cue) => {
+      const r = regMap.get(cue.id) || {};
+      const as = r.actualStart ?? null;
+      const ae = r.actualEnd ?? null;
+      const skipped = r.skipped === true || r.skipped === 1;
+      const isHandover = r.sourceVersionId !== null && r.sourceVersionId !== undefined;
+
+      let retroStatus;
+      if (skipped) retroStatus = 'SKIPPED';
+      else if (ae !== null) retroStatus = isHandover ? 'DONE_HANDOVER' : 'DONE';
+      else if (as !== null) retroStatus = 'RUNNING';
+      else retroStatus = 'PENDING';
+
+      // 有实际开始即可计算相对计划的有符号偏差（含交接完成项，供逐项展示）
+      const startDelta = as !== null ? as - cue.plannedStart : null;
+
+      let actualMinutes = null;
+      let netMinutes = null;
+      let deductedMinutes = 0;
+      let deductionSegments = [];
+      if (as !== null && ae !== null) {
+        actualMinutes = ae - as;
+        // 只扣「实际起止区间 ∩ 已结束停排段」；交集按并集合并，重叠分钟只扣一次
+        const overlaps = [];
+        for (const p of endedPauses) {
+          const lo = Math.max(as, p.pauseMinute);
+          const hi = Math.min(ae, p.resumeMinute);
+          if (hi > lo) overlaps.push({ pauseMinute: p.pauseMinute, resumeMinute: p.resumeMinute, reason: p.reason, minutes: hi - lo });
+        }
+        deductionSegments = overlaps;
+        deductedMinutes = unionLength(overlaps.map((o) => [o.pauseMinute, o.resumeMinute]));
+        netMinutes = Math.max(0, actualMinutes - deductedMinutes);
+      }
+
+      return {
+        cueRef: cue.id,
+        code: cue.code,
+        title: cue.title,
+        position: cue.position,
+        plannedStart: cue.plannedStart,
+        duration: cue.duration,
+        actualStart: as,
+        actualEnd: ae,
+        rowVer: r.rowVer ?? 1,
+        retroStatus,
+        statusLabel: RETRO_STATUS_LABEL[retroStatus] || retroStatus,
+        handoverSourceVersionId: r.sourceVersionId ?? null,
+        startDelta,
+        actualMinutes,
+        deductedMinutes,
+        netMinutes,
+        deductionSegments,
+        countedInSummary: retroStatus === 'DONE', // 仅本版完成计入汇总
+      };
+    });
+
+  // 按岗位汇总：仅「本版完成」项（跳过 / 未开始 / 进行中 / 交接完成均不计入）
+  const posMap = new Map();
+  for (const it of items) {
+    if (!posMap.has(it.position)) {
+      posMap.set(it.position, { position: it.position, doneCount: 0, netMinutes: 0, startDeltaSum: 0 });
+    }
+    if (it.countedInSummary) {
+      const p = posMap.get(it.position);
+      p.doneCount += 1;
+      p.netMinutes += it.netMinutes ?? 0;
+      p.startDeltaSum += it.startDelta ?? 0;
+    }
+  }
+  const byPosition = [...posMap.values()].sort((a, b) => a.position.localeCompare(b.position, 'zh-Hans-CN'));
+
+  const counts = {
+    total: items.length,
+    done: items.filter((i) => i.retroStatus === 'DONE').length,
+    handoverDone: items.filter((i) => i.retroStatus === 'DONE_HANDOVER').length,
+    running: items.filter((i) => i.retroStatus === 'RUNNING').length,
+    pending: items.filter((i) => i.retroStatus === 'PENDING').length,
+    skipped: items.filter((i) => i.retroStatus === 'SKIPPED').length,
+  };
+  const summaryTotals = {
+    doneCount: byPosition.reduce((n, p) => n + p.doneCount, 0),
+    netMinutes: byPosition.reduce((n, p) => n + p.netMinutes, 0),
+    startDeltaSum: byPosition.reduce((n, p) => n + p.startDeltaSum, 0),
+  };
+
+  return { items, byPosition, counts, summaryTotals, endedPauses, activePause };
+}
+
 module.exports = {
   timeToMin, minToTime, topoAnalyze, validatePlan, computeLive, explainSchedule, simulateWhatIf,
-  runningEndShift, interruptionHoldMinute,
+  runningEndShift, interruptionHoldMinute, buildRetrospective,
 };

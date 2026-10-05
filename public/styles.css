@@ -211,3 +211,25 @@ tr.interrupted-row:hover td { background: #f4e8ff; }
 .pause-count { color: #5b2a8f; font-weight: 600; }
 .pause-count-active { background: #f0e3fb; border: 1px solid #c9a3ea; border-radius: 6px; padding: 0 6px; }
 tr.pause-row-active td { background: #faf4ff; }
+
+/* ---------- 执行版复盘 ---------- */
+.retro-head-panel h3 { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.retro-sealed-tag { display: inline-block; background: #e3e8f5; color: #2f4a8f; border: 1px solid #b7c6e8; border-radius: 8px; padding: 2px 10px; font-size: 12px; font-weight: 600; }
+.badge.retro-handover { background: #e6f0fb; color: #23589e; }
+.retro-count-line { font-size: 13px; margin: 4px 0 14px; line-height: 2.2; }
+.retro-count-line strong { font-size: 15px; }
+.retro-sep { color: #aab; margin: 0 6px; }
+.retro-summary-panel { display: flex; flex-direction: column; gap: 12px; }
+.retro-totals { display: flex; gap: 14px; flex-wrap: wrap; }
+.retro-total { flex: 1 1 160px; background: #f6f8fc; border: 1px solid #e0e6f2; border-radius: 10px; padding: 12px 16px; display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
+.retro-total-num { font-size: 26px; font-weight: 700; color: #22324f; }
+.retro-table-wrap td, .retro-table-wrap th { font-size: 12.5px; }
+tr.retro-row-skipped td { background: #f6f3fb; color: #8a8299; }
+tr.retro-row-handover td { background: #f2f7fd; }
+.retro-handover-tag { font-size: 11px; color: #23589e; background: #dcebf9; border-radius: 6px; padding: 1px 6px; display: inline-block; margin-top: 2px; }
+.retro-late { color: #c0392b; font-weight: 700; }
+.retro-early { color: #1d7a43; font-weight: 700; }
+.retro-zero { color: #667; font-weight: 600; }
+.retro-actions { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.retro-actions .muted { flex: 1 1 320px; font-size: 12.5px; line-height: 1.7; }
+.retro-sealed-box { background: #eef2fb; border: 1px solid #c3d0ee; color: #2f4a8f; border-radius: 10px; padding: 10px 14px; margin-bottom: 14px; font-size: 13px; }

@@ -3,13 +3,14 @@
 process.env.TZ = process.env.TZ || 'Asia/Shanghai';
 
 const path = require('path');
+const crypto = require('crypto');
 const express = require('express');
 const session = require('express-session');
 
 const { db, getMeta, setMeta } = require('./db');
 const { verifyPassword } = require('./auth');
 const { init } = require('./initdb');
-const { timeToMin, minToTime, validatePlan, computeLive, topoAnalyze, explainSchedule, simulateWhatIf } = require('./scheduling');
+const { timeToMin, minToTime, validatePlan, computeLive, topoAnalyze, explainSchedule, simulateWhatIf, buildRetrospective } = require('./scheduling');
 
 init();
 
@@ -954,6 +955,8 @@ app.get('/api/versions', requireAuth, (req, res, next) => {
               (SELECT COUNT(*) FROM registrations r WHERE r.version_id = v.id AND r.skipped = 1) AS skip_count,
               (SELECT COUNT(*) FROM rehearsal_interruptions i WHERE i.version_id = v.id) AS interruption_count,
               (SELECT COUNT(*) FROM rehearsal_interruptions i WHERE i.version_id = v.id AND i.resume_minute IS NULL) AS interruption_active_count,
+              (SELECT COUNT(*) FROM retrospective_seals rs WHERE rs.version_id = v.id) AS sealed_count,
+              (SELECT rs.sealed_at FROM retrospective_seals rs WHERE rs.version_id = v.id) AS sealed_at,
               (SELECT COUNT(*) FROM published_cues p WHERE p.version_id = v.id) AS cue_count
        FROM rehearsal_versions v ORDER BY v.version_no DESC`
     ).all();
@@ -963,6 +966,8 @@ app.get('/api/versions', requireAuth, (req, res, next) => {
         createdAt: r.created_at, regCount: r.reg_count, skipCount: r.skip_count,
         interruptionCount: r.interruption_count,
         interruptionActive: r.interruption_active_count > 0,
+        sealed: r.sealed_count > 0,
+        sealedAt: r.sealed_at,
         cueCount: r.cue_count,
       })),
     });
@@ -2104,6 +2109,273 @@ app.get('/api/live/interruptions', requireAuth, (req, res, next) => {
       interruptions: rows.map(interruptionJson),
     });
   } catch (e) { next(e); }
+});
+
+// ---------- 舞监：执行版复盘（预览 / 封存 / 历史回看） ----------
+
+// 复盘封存依据：当前执行版 id + 全部登记行版本 + 停排状态（已结束停排段 / 进行中停排）。
+// 封存时舞监须携预览所见依据；服务端重算当前依据逐项核对，任一变化整体拒绝。
+function retrospectiveBasis(versionId) {
+  const rows = db.prepare(
+    'SELECT cue_ref, row_ver FROM registrations WHERE version_id = ? ORDER BY cue_ref'
+  ).all(versionId).map((r) => ({ cueRef: r.cue_ref, rowVersion: r.row_ver }));
+  const itRows = db.prepare(
+    'SELECT pause_minute, resume_minute FROM rehearsal_interruptions WHERE version_id = ? ORDER BY id'
+  ).all(versionId);
+  return {
+    versionId,
+    rows,
+    endedPauses: itRows
+      .filter((i) => i.resume_minute !== null)
+      .map((i) => ({ pauseMinute: i.pause_minute, resumeMinute: i.resume_minute })),
+    activePause: (() => {
+      const a = itRows.find((i) => i.resume_minute === null);
+      return a ? { pauseMinute: a.pause_minute } : null;
+    })(),
+  };
+}
+
+function retrospectiveBasisToken(basis) {
+  return crypto.createHash('sha256').update(JSON.stringify(basis)).digest('hex');
+}
+
+function getRetrospectiveSeal(versionId) {
+  return db.prepare('SELECT * FROM retrospective_seals WHERE version_id = ?').get(versionId) || null;
+}
+
+function sealJson(row) {
+  return {
+    id: row.id,
+    versionId: row.version_id,
+    sealedBy: row.sealed_by,
+    sealedAt: row.sealed_at,
+    basisToken: row.basis_token,
+  };
+}
+
+// 复盘预览负载（逐项明细 + 岗位汇总）；includeBasis=true 时附带封存依据与指纹（仅当前执行版需要）
+function retrospectivePayload(versionRow, { includeBasis = false } = {}) {
+  const { cues, deps, regMap, interruptions } = versionInputs(versionRow.id);
+  const retro = buildRetrospective(cues, deps, regMap, interruptions);
+  const latestNo = db.prepare('SELECT MAX(version_no) AS m FROM rehearsal_versions').get().m;
+
+  // 交接来源版本号（逐项标注「交接自第 N 版」，交接完成项不计入本版汇总）
+  const sourceRefs = [...new Set(retro.items
+    .map((it) => it.handoverSourceVersionId)
+    .filter((id) => id !== null))];
+  const sourceVerNo = new Map();
+  if (sourceRefs.length) {
+    db.prepare(
+      `SELECT id, version_no FROM rehearsal_versions WHERE id IN (${sourceRefs.map(() => '?').join(',')})`
+    ).all(...sourceRefs).forEach((v) => sourceVerNo.set(v.id, v.version_no));
+  }
+
+  const sealRow = getRetrospectiveSeal(versionRow.id);
+  const items = retro.items.map((it) => ({
+    cueRef: it.cueRef,
+    code: it.code,
+    title: it.title,
+    position: it.position,
+    plannedStartText: minToTime(it.plannedStart),
+    plannedEndText: minToTime(it.plannedStart + it.duration),
+    duration: it.duration,
+    actualStartText: minToTime(it.actualStart),
+    actualEndText: minToTime(it.actualEnd),
+    rowVersion: it.rowVer,
+    retroStatus: it.retroStatus,
+    statusLabel: it.statusLabel,
+    countedInSummary: it.countedInSummary,
+    handover: it.handoverSourceVersionId !== null
+      ? { sourceVersionId: it.handoverSourceVersionId, sourceVersionNo: sourceVerNo.get(it.handoverSourceVersionId) ?? null }
+      : null,
+    startDeltaMinutes: it.startDelta,       // 有符号：实际开始 - 计划开始（负=提前）；未开始为 null
+    actualMinutes: it.actualMinutes,        // 实际持续；未完成项为 null
+    deductedMinutes: it.deductedMinutes,    // 与已结束停排段交集的并集分钟（重叠只扣一次）
+    netMinutes: it.netMinutes,              // 扣除停排后的净执行分钟；未完成项为 null
+    deductionSegments: it.deductionSegments.map((s) => ({
+      pauseText: minToTime(s.pauseMinute),
+      resumeText: minToTime(s.resumeMinute),
+      minutes: s.minutes,
+      reason: s.reason,
+    })),
+  }));
+
+  return {
+    versionId: versionRow.id,
+    versionNo: versionRow.version_no,
+    note: versionRow.note,
+    createdAt: versionRow.created_at,
+    isLatest: versionRow.version_no === latestNo,
+    sealed: sealRow ? sealJson(sealRow) : null,
+    computedAt: new Date().toLocaleString('sv-SE'),
+    counts: retro.counts,
+    summary: retro.summaryTotals,
+    byPosition: retro.byPosition,
+    items,
+    interruptions: interruptions.map(interruptionJson),
+    activeInterruption: (() => {
+      const active = interruptions.find((it) => it.resumeMinute == null);
+      return active ? interruptionJson(active) : null;
+    })(),
+    ...(includeBasis ? (() => {
+      const basis = retrospectiveBasis(versionRow.id);
+      return { basis, basisToken: retrospectiveBasisToken(basis) };
+    })() : {}),
+  };
+}
+
+// 当前执行版复盘预览（舞监）：始终按当前登记/停排实时计算，更正或恢复联排后刷新即更新；
+// 已封存时返回中带 sealed（预览本身仍实时可见，封存入口关闭）。
+app.get('/api/live/retrospective', requireSM, (req, res, next) => {
+  try {
+    const ver = latestPublishedVersion();
+    if (!ver) return res.json({ version: null, message: '尚未发布任何联排版本' });
+    res.json({ version: retrospectivePayload(ver, { includeBasis: true }) });
+  } catch (e) { next(e); }
+});
+
+// 历史版（或当前版）复盘回看（舞监）：已封存返回封存时快照（只读，永不改变）；
+// 未封存返回该版实时明细（归档版登记不再变化，等价于当前明细）；无版本/无权限明确拒绝。
+app.get('/api/versions/:id/retrospective', requireSM, (req, res, next) => {
+  try {
+    const versionId = Number(req.params.id);
+    if (!Number.isInteger(versionId)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的版本 id');
+    const ver = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+    if (!ver) throw new ApiError(404, 'NOT_FOUND', '版本不存在');
+    const sealRow = getRetrospectiveSeal(ver.id);
+    const latest = latestPublishedVersion();
+    if (sealRow) {
+      return res.json({
+        kind: 'sealed',
+        isLatest: latest && latest.id === ver.id,
+        seal: sealJson(sealRow),
+        snapshot: JSON.parse(sealRow.snapshot_json),
+      });
+    }
+    res.json({ kind: 'live', isLatest: latest && latest.id === ver.id, version: retrospectivePayload(ver) });
+  } catch (e) { next(e); }
+});
+
+// 封存复盘：舞监携预览所见的执行版、登记行版本与停排状态，在同一事务内核验后把明细与汇总固化。
+// 任一依据变化（版本被新版替代 / 登记行版本推进 / 停排段变化）或该版已封存，均整体拒绝。
+app.post('/api/live/retrospective/seal', requireSM, (req, res, next) => {
+  try {
+    const body = req.body || {};
+    const versionId = Number(body.versionId);
+    if (!Number.isInteger(versionId)) throw new ApiError(400, 'BAD_INPUT', '缺少有效的 versionId');
+    const basis = body.basis;
+    if (!basis || typeof basis !== 'object' || !Array.isArray(basis.rows)) {
+      throw new ApiError(400, 'BAD_INPUT',
+        '请携带复盘预览所见的封存依据 basis（执行版、全部登记行版本 rows[]、已结束停排段与进行中停排）');
+    }
+
+    const result = db.transaction(() => {
+      const ver = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+      if (!ver) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+      const latest = latestPublishedVersion();
+      if (!latest || latest.id !== ver.id) {
+        throw new ApiError(409, 'RETROSPECTIVE_ARCHIVED',
+          `第 ${ver.version_no} 版已不是当前执行版（当前为第 ${latest ? latest.version_no : '?'} 版），只能封存当前执行版的复盘`,
+          { currentVersionId: latest ? latest.id : null });
+      }
+      if (getRetrospectiveSeal(ver.id)) {
+        throw new ApiError(409, 'RETROSPECTIVE_SEALED',
+          `第 ${ver.version_no} 版的复盘已封存，每版仅能封存一次；可在历史回看页查看封存快照`);
+      }
+
+      // 依据核对：登记行版本、已结束停排段、进行中停排任一变化逐项列出，整体拒绝
+      const current = retrospectiveBasis(ver.id);
+      const issues = [];
+      if (Number(basis.versionId) !== current.versionId) {
+        issues.push({ kind: 'version', reason: `封存依据基于版本 id ${basis.versionId}，当前执行版 id 为 ${current.versionId}，请重新预览后再封存` });
+      }
+      // 登记行版本：依据中携带的是预览所见全部登记行
+      const submittedRows = new Map(basis.rows.map((r) => [Number(r.cueRef), Number(r.rowVersion)]));
+      if (submittedRows.size !== basis.rows.length) {
+        throw new ApiError(400, 'BAD_INPUT', '封存依据的登记行存在重复 cueRef，请重新预览后再封存');
+      }
+      if (submittedRows.size !== current.rows.length) {
+        issues.push({ kind: 'rows', reason: `封存依据的登记行数量（${submittedRows.size}）与当前执行版（${current.rows.length}）不一致，请重新预览后再封存` });
+      }
+      for (const r of current.rows) {
+        if (!submittedRows.has(r.cueRef)) {
+          issues.push({ kind: 'row', cueRef: r.cueRef, reason: `封存依据缺少提示项引用 ${r.cueRef} 的登记行版本，请重新预览后再封存` });
+          continue;
+        }
+        const seen = submittedRows.get(r.cueRef);
+        if (seen !== r.rowVersion) {
+          const code = db.prepare('SELECT code FROM published_cues WHERE version_id=? AND cue_ref=?')
+            .get(ver.id, r.cueRef)?.code || `#${r.cueRef}`;
+          issues.push({
+            kind: 'row', cueRef: r.cueRef, code, previewRowVersion: seen, currentRowVersion: r.rowVersion,
+            reason: `「${code}」登记行版本已变化（预览时 v${seen}，当前 v${r.rowVersion}，可能被岗位登记、舞监更正或跳过更新），请重新预览后再封存`,
+          });
+        }
+      }
+      for (const ref of submittedRows.keys()) {
+        if (!current.rows.some((r) => r.cueRef === ref)) {
+          issues.push({ kind: 'row', cueRef: ref, reason: `提示项引用 ${ref} 已不在当前执行版中，请重新预览后再封存` });
+        }
+      }
+      // 已结束停排段：按 (pause, resume) 集合比较（新增恢复 / 更正停排记录都会变化）
+      const segKey = (s) => `${Number(s.pauseMinute)}#${Number(s.resumeMinute)}`;
+      const submittedSegs = new Set((Array.isArray(basis.endedPauses) ? basis.endedPauses : []).map(segKey));
+      const currentSegs = new Set(current.endedPauses.map(segKey));
+      for (const k of currentSegs) {
+        if (!submittedSegs.has(k)) {
+          const [p, r] = k.split('#').map(Number);
+          issues.push({ kind: 'interruption', reason: `预览后新增/变化了已结束停排段（${minToTime(p)}–${minToTime(r)}），请重新预览后再封存` });
+        }
+      }
+      for (const k of submittedSegs) {
+        if (!currentSegs.has(k)) {
+          const [p, r] = k.split('#').map(Number);
+          issues.push({ kind: 'interruption', reason: `预览时的已结束停排段（${minToTime(p)}–${minToTime(r)}）已不存在，请重新预览后再封存` });
+        }
+      }
+      // 进行中停排：null 与 {pauseMinute} 比较（停排 / 恢复都会改变依据）
+      const submittedActive = basis.activePause === null || basis.activePause === undefined
+        ? null : { pauseMinute: Number(basis.activePause.pauseMinute) };
+      const activeChanged = (submittedActive?.pauseMinute ?? null) !== (current.activePause?.pauseMinute ?? null);
+      if (activeChanged) {
+        issues.push({
+          kind: 'interruption',
+          reason: `停排状态已变化（预览时${submittedActive ? `停排中（自 ${minToTime(submittedActive.pauseMinute)} 起）` : '无进行中停排'}，当前${current.activePause ? `停排中（自 ${minToTime(current.activePause.pauseMinute)} 起）` : '无进行中停排'}），请重新预览后再封存`,
+        });
+      }
+      if (issues.length) {
+        throw new ApiError(409, 'RETROSPECTIVE_STALE',
+          `复盘封存依据已变化（${issues.length} 项），本次封存已整体拒绝，请重新预览后再封存`,
+          { items: issues });
+      }
+
+      // 依据一致：固化当时明细与汇总为快照（basis 单独留存，快照不含实时 basis）
+      const payload = retrospectivePayload(ver);
+      const stamp = new Date().toLocaleString('sv-SE');
+      const token = retrospectiveBasisToken(current);
+      const info = db.prepare(
+        `INSERT INTO retrospective_seals(version_id, sealed_by, sealed_at, basis_token, basis_json, snapshot_json)
+         VALUES (?, ?, ?, ?, ?, ?)`
+      ).run(ver.id, req.session.user.displayName, stamp, token,
+        JSON.stringify(current), JSON.stringify(payload));
+      return { sealId: info.lastInsertRowid, stamp, token, snapshot: payload };
+    })();
+
+    res.status(201).json({
+      kind: 'sealed',
+      isLatest: true,
+      seal: {
+        id: result.sealId, versionId, sealedBy: req.session.user.displayName,
+        sealedAt: result.stamp, basisToken: result.token,
+      },
+      snapshot: result.snapshot,
+    });
+  } catch (e) {
+    if (String(e.code || '').includes('SQLITE_CONSTRAINT')) {
+      return next(new ApiError(409, 'RETROSPECTIVE_SEALED', '该版本的复盘已封存，每版仅能封存一次；可在历史回看页查看封存快照'));
+    }
+    next(e);
+  }
 });
 
 // ---------- 静态页面与错误处理 ----------

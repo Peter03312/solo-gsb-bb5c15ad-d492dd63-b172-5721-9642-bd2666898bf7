@@ -13,6 +13,7 @@ const state = {
   deputies: null,
   skipPreview: null,
   whatifInputs: new Map(),
+  retro: null,
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -83,7 +84,7 @@ function showApp() {
   $('#app-view').hidden = false;
   const isSM = state.me.role === 'sm';
   const tabs = isSM
-    ? [['draft', '草稿编辑'], ['live', '现场联排'], ['versions', '发布版本']]
+    ? [['draft', '草稿编辑'], ['live', '现场联排'], ['retro', '复盘'], ['versions', '发布版本']]
     : [['live', '现场联排'], ['versions', '发布版本']];
   $('#tabs').innerHTML = tabs.map(([k, label], i) =>
     `<button data-tab="${k}" class="${i === 0 ? 'active' : ''}">${label}</button>`).join('');
@@ -95,9 +96,10 @@ function showApp() {
 
 function switchTab(tab) {
   $$('#tabs button').forEach((b) => b.classList.toggle('active', b.dataset.tab === tab));
-  ['draft', 'live', 'versions'].forEach((t) => { $('#tab-' + t).hidden = t !== tab; });
+  ['draft', 'live', 'retro', 'versions'].forEach((t) => { $('#tab-' + t).hidden = t !== tab; });
   if (tab === 'draft') loadDraft().catch((e) => alertBar('error', errorToHtml(e)));
   if (tab === 'live') loadLive().catch((e) => alertBar('error', errorToHtml(e)));
+  if (tab === 'retro') loadRetro().catch((e) => alertBar('error', errorToHtml(e)));
   if (tab === 'versions') loadVersions().catch((e) => alertBar('error', errorToHtml(e)));
 }
 
@@ -1554,6 +1556,190 @@ $('#modal-overlay').addEventListener('submit', async (ev) => {
   }
 });
 
+// ---------- 执行版复盘（舞监） ----------
+
+async function loadRetro() {
+  const data = await api('GET', '/api/live/retrospective');
+  state.retro = data.version;
+  renderRetro();
+}
+
+function retroStatusBadge(s) {
+  if (s === 'DONE') return '<span class="badge done">本版完成</span>';
+  if (s === 'DONE_HANDOVER') return '<span class="badge retro-handover">↩ 交接完成</span>';
+  if (s === 'RUNNING') return '<span class="badge running">进行中</span>';
+  if (s === 'SKIPPED') return '<span class="badge skipped">跳过</span>';
+  return '<span class="badge pending">未开始</span>';
+}
+
+// 有符号分钟偏差：正=推迟（红），负=提前（绿），0 准时
+function retroDeltaText(delta) {
+  if (delta === null || delta === undefined) return '—';
+  if (delta === 0) return '<span class="retro-zero">0</span>';
+  const cls = delta > 0 ? 'retro-late' : 'retro-early';
+  const sign = delta > 0 ? '+' : '';
+  return `<span class="${cls}">${sign}${delta}</span>`;
+}
+
+// 逐项明细表（实时预览与封存快照共用）
+function retroItemsTable(items) {
+  return `<div class="table-wrap retro-table-wrap">
+    <table>
+      <thead><tr>
+        <th>编号</th><th>说明</th><th>岗位</th><th>计划开始</th><th>实际开始</th><th>实际完成</th>
+        <th title="实际开始相对计划开始的有符号分钟偏差（负=提前，正=推迟）">开始偏差(分)</th>
+        <th title="实际完成 − 实际开始">实际持续(分)</th>
+        <th title="实际起止区间与已结束停排段交集的并集分钟，重叠分钟只扣一次">停排扣除(分)</th>
+        <th title="实际持续 − 停排扣除">净执行(分)</th>
+        <th>状态</th>
+      </tr></thead>
+      <tbody>${items.map((it) => `<tr class="retro-row-${it.retroStatus === 'DONE_HANDOVER' ? 'handover' : it.retroStatus === 'SKIPPED' ? 'skipped' : 'normal'}">
+        <td><strong>${esc(it.code)}</strong>
+          ${it.handover ? `<div class="retro-handover-tag" title="交接自第 ${it.handover.sourceVersionNo} 版，不计入本版已完成汇总">↩ 第${it.handover.sourceVersionNo ?? '?'}版</div>` : ''}
+          ${it.deductionSegments?.length ? `<div class="pause-shift">⏸ 扣 ${it.deductedMinutes} 分</div>` : ''}
+        </td>
+        <td>${esc(it.title)}</td>
+        <td>${esc(it.position)}</td>
+        <td class="mono">${esc(it.plannedStartText)}</td>
+        <td class="mono">${esc(it.actualStartText ?? '—')}</td>
+        <td class="mono">${esc(it.actualEndText ?? '—')}</td>
+        <td class="mono">${retroDeltaText(it.startDeltaMinutes)}</td>
+        <td class="mono">${it.actualMinutes ?? '—'}</td>
+        <td class="mono">${it.deductedMinutes ? `<span class="pause-shift">${it.deductedMinutes}</span>` : (it.actualMinutes === null ? '—' : 0)}</td>
+        <td class="mono"><strong>${it.netMinutes ?? '—'}</strong></td>
+        <td>${retroStatusBadge(it.retroStatus)}</td>
+      </tr>`).join('')}</tbody>
+    </table>
+  </div>`;
+}
+
+function retroPositionTable(byPosition) {
+  return `<div class="table-wrap">
+    <table>
+      <thead><tr><th>岗位</th><th>本版完成数</th><th>净执行分钟合计</th><th title="本版完成项的开始偏差之和">开始偏差合计(分)</th></tr></thead>
+      <tbody>${byPosition.map((p) => `<tr>
+        <td>${esc(p.position)}</td>
+        <td class="mono">${p.doneCount}</td>
+        <td class="mono">${p.netMinutes}</td>
+        <td class="mono">${retroDeltaText(p.startDeltaSum)}</td>
+      </tr>`).join('')}</tbody>
+    </table>
+  </div>`;
+}
+
+// 复盘主体 HTML（当前执行版实时预览与封存快照共用同构渲染）
+function retrospectiveHtml(p) {
+  const c = p.counts || {};
+  const s = p.summary || {};
+  const endedCount = (p.interruptions || []).filter((i) => !i.active).length;
+  return `
+    <div class="retro-count-line">
+      ${retroStatusBadge('DONE')} 本版完成 <strong>${c.done ?? 0}</strong>
+      <span class="retro-sep">·</span> ${retroStatusBadge('DONE_HANDOVER')} <strong>${c.handoverDone ?? 0}</strong>（不计汇总）
+      <span class="retro-sep">·</span> ${retroStatusBadge('RUNNING')} <strong>${c.running ?? 0}</strong>
+      <span class="retro-sep">·</span> ${retroStatusBadge('PENDING')} <strong>${c.pending ?? 0}</strong>
+      <span class="retro-sep">·</span> ${retroStatusBadge('SKIPPED')} <strong>${c.skipped ?? 0}</strong>
+    </div>
+    <div class="panel retro-summary-panel">
+      <h3>本版汇总（仅「本版完成」项；交接完成 / 进行中 / 未开始 / 跳过均不计入）</h3>
+      <div class="retro-totals">
+        <div class="retro-total"><span class="retro-total-num">${s.doneCount ?? 0}</span><span class="muted">本版完成数</span></div>
+        <div class="retro-total"><span class="retro-total-num">${s.netMinutes ?? 0}</span><span class="muted">净执行分钟合计</span></div>
+        <div class="retro-total"><span class="retro-total-num ${(s.startDeltaSum ?? 0) > 0 ? 'retro-late' : (s.startDeltaSum ?? 0) < 0 ? 'retro-early' : ''}">${s.startDeltaSum ?? 0}</span><span class="muted">开始偏差合计(分)</span></div>
+      </div>
+      ${retroPositionTable(p.byPosition || [])}
+    </div>
+    <div class="panel">
+      <h3>逐项明细</h3>
+      <p class="muted">
+        开始偏差 = 实际开始 − 计划开始（有符号分钟）；实际持续 = 实际完成 − 实际开始；
+        净执行 = 实际持续 − 实际起止区间与<strong>已结束停排段</strong>交集的并集分钟（重叠只扣一次，共 ${endedCount} 段已结束停排参与扣除；进行中停排恢复时刻未定，暂不扣除）。
+        未完成项（进行中 / 未开始 / 跳过）的实际持续与净执行分钟为空；交接自旧版的完成项单独标识、不计入本版汇总。
+      </p>
+      ${retroItemsTable(p.items || [])}
+    </div>`;
+}
+
+function renderRetro() {
+  const body = $('#retro-body');
+  const p = state.retro;
+  if (!p) {
+    body.innerHTML = '<div class="panel muted">尚未发布任何联排版本，暂无可复盘的执行版。</div>';
+    return;
+  }
+  const sealed = p.sealed;
+  body.innerHTML = `
+    <div class="panel retro-head-panel">
+      <h3>第 ${p.versionNo} 版复盘预览 ${p.isLatest ? '<span class="latest-tag">当前执行版</span>' : ''}
+        ${sealed ? '<span class="retro-sealed-tag">🔒 已封存</span>' : ''}</h3>
+      <div class="muted">${esc(p.note || '')} · 发布于 ${esc(p.createdAt)} · 预览计算于 ${esc(p.computedAt)}</div>
+      <div class="muted">预览依据冻结计划、现场登记行（当前登记行版本快照）与停排状态实时计算；岗位登记更正、舞监更正或恢复联排后点「刷新预览」即更新。</div>
+    </div>
+    ${sealed ? `<div class="pause-resumed-banner">
+      🔒 本版复盘已于 <strong>${esc(sealed.sealedAt)}</strong> 由 ${esc(sealed.sealedBy)} 封存（每版仅一次）。
+      下方为<strong>实时明细</strong>仅供参考；封存后的明细与岗位汇总快照不可改写，可在「发布版本」页回看封存快照。
+    </div>` : ''}
+    ${p.activeInterruption ? `<div class="pause-banner">
+      ⛔ 当前停排中（自 <strong class="mono">${esc(p.activeInterruption.pauseText)}</strong> 起）：仍可封存复盘，但净执行分钟只扣已结束停排段，进行中停排恢复后请刷新预览再封存。
+    </div>` : ''}
+    ${retrospectiveHtml(p)}
+    <div class="panel retro-actions">
+      ${sealed
+        ? '<span class="muted">本版已封存，不能再次封存。</span>'
+        : `<button id="retro-seal-btn" class="danger" type="button">封存本版复盘（快照固化，此后不可改写）</button>
+           <span class="muted">封存将携当前预览所见的执行版、全部登记行版本与停排状态在服务器同事务核对：任一依据变化（登记更正、跳过、停排 / 恢复等）整体拒绝，请刷新后重新封存。</span>`}
+    </div>`;
+}
+
+$('#retro-reload').addEventListener('click', () =>
+  loadRetro().then(() => alertBar('ok', '复盘预览已刷新')).catch((e) => alertBar('error', errorToHtml(e))));
+
+$('#retro-body').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('#retro-seal-btn');
+  if (!btn) return;
+  const p = state.retro;
+  if (!p || p.sealed) return;
+  if (!window.confirm(`确认封存第 ${p.versionNo} 版的复盘？\n\n封存后明细与岗位汇总将作为当时快照永久保存；此后登记更正、交接或发布新版均不得改写，且每版仅能封存一次。`)) return;
+  btn.disabled = true;
+  try {
+    const data = await api('POST', '/api/live/retrospective/seal', {
+      versionId: p.versionId,
+      basis: p.basis,
+    });
+    state.retro = data.snapshot;
+    // 封存后实时负载不含 basis，重新取一次预览以保留实时视图上下文
+    try { await loadRetro(); } catch { state.retro = data.snapshot; renderRetro(); }
+    renderRetro();
+    alertBar('ok', `第 ${p.versionNo} 版复盘已封存（${data.seal.sealedAt}），快照已固化`);
+  } catch (e) {
+    btn.disabled = false;
+    alertBar('error', errorToHtml(e));
+  }
+});
+
+// 历史版复盘回看（舞监；从「发布版本」页进入）：已封存→封存快照，未封存→该版实时明细
+async function openRetroVersion(versionId, versionNo) {
+  try {
+    const data = await api('GET', `/api/versions/${versionId}/retrospective`);
+    if (data.kind === 'sealed') {
+      const p = data.snapshot;
+      openModal(`复盘封存快照：第 ${p.versionNo} 版`, `
+        <div class="retro-sealed-box">
+          🔒 <strong>封存快照（只读）</strong>：${esc(data.seal.sealedBy)} 于 ${esc(data.seal.sealedAt)} 封存。
+          此后登记更正、交接或发布新版均不改写此快照；每版仅封存一次。
+        </div>
+        ${retrospectiveHtml(p)}`);
+    } else {
+      const p = data.version;
+      openModal(`复盘实时明细：第 ${p.versionNo} 版（尚未封存）`, `
+        <div class="pause-active-box">
+          该版复盘<strong>尚未封存</strong>，以下为该版当前实时明细${data.isLatest ? '（当前执行版，登记更正或停排 / 恢复后会变化）' : '（归档版本登记已冻结）'}；封存请到「复盘」页对当前执行版操作。
+        </div>
+        ${retrospectiveHtml(p)}`);
+    }
+  } catch (e) { alertBar('error', errorToHtml(e)); }
+}
+
 // ---------- 已发布版本回看 ----------
 
 async function loadVersions() {
@@ -1572,12 +1758,23 @@ function renderVersions() {
       <td>${v.regCount}</td>
       <td>${v.skipCount ? `<span class="skip-count">⛔ ${v.skipCount}</span>` : 0}</td>
       <td>${v.interruptionCount ? `<span class="pause-count ${v.interruptionActive ? 'pause-count-active' : ''}">⏸ ${v.interruptionCount}${v.interruptionActive ? '（进行中）' : ''}</span>` : 0}</td>
-      <td><button class="ghost tiny" data-act="view-version" data-id="${v.id}">回看</button></td>
+      <td>${v.sealed
+        ? `<span class="retro-sealed-tag" title="${esc(v.sealedAt || '')} 封存">🔒 已封存</span>`
+        : '<span class="muted">未封存</span>'}</td>
+      <td>
+        <button class="ghost tiny" data-act="view-version" data-id="${v.id}">回看</button>
+        ${state.me?.role === 'sm' ? `<button class="ghost tiny" data-act="view-retro" data-id="${v.id}" data-no="${v.versionNo}">复盘${v.sealed ? '🔒' : ''}</button>` : ''}
+      </td>
     </tr>`).join('')
-    || '<tr><td colspan="8" class="muted">暂无已发布版本。</td></tr>';
+    || '<tr><td colspan="9" class="muted">暂无已发布版本。</td></tr>';
 }
 
 $('#versions-tbody').addEventListener('click', async (ev) => {
+  const retroBtn = ev.target.closest('button[data-act="view-retro"]');
+  if (retroBtn && state.me?.role === 'sm') {
+    await openRetroVersion(Number(retroBtn.dataset.id), Number(retroBtn.dataset.no));
+    return;
+  }
   const btn = ev.target.closest('button[data-act="view-version"]');
   if (!btn) return;
   try {

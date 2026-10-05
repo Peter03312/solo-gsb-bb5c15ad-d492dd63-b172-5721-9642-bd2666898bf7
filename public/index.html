@@ -203,6 +203,15 @@
         </div>
       </div>
 
+      <!-- 执行版复盘（舞监） -->
+      <div id="tab-retro" class="tabpane" hidden>
+        <div class="pane-head">
+          <h2>执行版复盘</h2>
+          <button id="retro-reload" class="ghost">刷新预览</button>
+        </div>
+        <div id="retro-body"><span class="muted">加载中…</span></div>
+      </div>
+
       <!-- 已发布版本回看 -->
       <div id="tab-versions" class="tabpane" hidden>
         <div class="pane-head">
@@ -212,7 +221,7 @@
         <div class="panel">
           <div class="table-wrap">
             <table>
-              <thead><tr><th>版本号</th><th>说明</th><th>发布时间</th><th>提示项</th><th>已有登记</th><th>已跳过</th><th>停排</th><th>操作</th></tr></thead>
+              <thead><tr><th>版本号</th><th>说明</th><th>发布时间</th><th>提示项</th><th>已有登记</th><th>已跳过</th><th>停排</th><th>复盘</th><th>操作</th></tr></thead>
               <tbody id="versions-tbody"></tbody>
             </table>
           </div>

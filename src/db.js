@@ -170,6 +170,19 @@ CREATE TABLE IF NOT EXISTS rehearsal_interruptions (
   resumed_at    TEXT
 );
 
+-- 执行版复盘封存：每版至多封存一次（version_id 唯一）。
+-- 封存时把舞监所见的执行版、登记行版本与停排状态作为依据（basis_token/basis_json），
+-- 明细与岗位汇总作为当时快照（snapshot_json）整体保存；此后登记更正、交接或发布新版均不改写。
+CREATE TABLE IF NOT EXISTS retrospective_seals (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id  INTEGER NOT NULL UNIQUE REFERENCES rehearsal_versions(id) ON DELETE CASCADE,
+  sealed_by   TEXT NOT NULL,             -- 封存操作者（舞监）
+  sealed_at   TEXT NOT NULL,             -- 封存时间戳
+  basis_token TEXT NOT NULL,             -- 依据指纹（执行版 + 登记行版本 + 停排状态）
+  basis_json  TEXT NOT NULL,             -- 依据明细（登记行版本、已结束停排段、进行中停排）
+  snapshot_json TEXT NOT NULL            -- 封存时的复盘预览完整快照（逐项明细 + 岗位汇总）
+);
+
 -- 签认时直接前置项登记行版本快照（任一变化即失效）
 CREATE TABLE IF NOT EXISTS release_signoff_preds (
   signoff_id  INTEGER NOT NULL REFERENCES release_signoffs(id) ON DELETE CASCADE,
